@@ -12,9 +12,22 @@ npm run dev      # http://localhost:5190 (or whatever Vite picks)
 
 Needs a WebGPU browser (Chrome/Edge 113+).
 
-Press **`/`** for the debug panel (Tweakpane): FPS, **compute ms/frame** (GPU
-timestamp-query), collision mode, particle count, density, zoom, speed,
-restitution, heat, particle size, pause.
+Press **`/`** for the debug UI — two panes:
+
+- **controls** (right): collision mode, particle count, density, zoom, speed,
+  restitution, heat, particle size, **grid overlay**, pause.
+- **metrics** (left): FPS, frame ms (CPU), compute ms (GPU timestamp-query),
+  JS heap + GPU buffer memory, and live grid occupancy (cells, occupied,
+  occupied %, avg/occupied cell, max/cell, overflow drops).
+
+### Grid overlay
+
+Toggle **grid overlay** to draw the hash grid: lines per cell + a heatmap tint
+(blue→red) by occupancy. Lets you *see* the algorithm — how particles bin into
+cells, where buckets fill toward `MAX_PER_CELL`, and where Mode B would drop
+overflow. Occupancy is computed by a tiny mode-independent count pass that runs
+only while the panel is open (outside the timed region, so it doesn't pollute
+`compute ms`).
 
 ## Density & camera
 

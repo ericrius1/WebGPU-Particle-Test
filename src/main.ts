@@ -29,6 +29,7 @@ async function boot() {
     maxSize: 0.011,
     coverage: 0.08,
     paused: false,
+    showGrid: false,
   };
 
   const engine = new Engine(device, ctx, format, params);
@@ -44,17 +45,14 @@ async function boot() {
   resize();
   window.addEventListener("resize", resize);
 
-  // ---- debug panel (tweakpane), hidden until "/" ------------------------
-  const stats = { fps: 0, computeMs: 0 };
-  const wrap = document.createElement("div");
-  wrap.style.cssText = "position:fixed;top:10px;right:10px;z-index:20;display:none;width:300px;";
-  document.body.appendChild(wrap);
-  const pane = new Pane({ container: wrap, title: "particles / debug" });
+  const hasHeap = !!(performance as any).memory;
 
-  pane.addBinding(stats, "fps", { readonly: true, view: "graph", min: 0, max: 165 });
-  if (engine.canTimestamp) {
-    pane.addBinding(stats, "computeMs", { readonly: true, view: "graph", min: 0, max: 8, label: "compute ms" });
-  }
+  // ---- controls pane (top-right), hidden until "/" ----------------------
+  const ctrlWrap = document.createElement("div");
+  ctrlWrap.style.cssText = "position:fixed;top:10px;right:10px;z-index:20;display:none;width:300px;";
+  document.body.appendChild(ctrlWrap);
+  const pane = new Pane({ container: ctrlWrap, title: "controls" });
+
   pane.addBinding(params, "mode", {
     options: { "A — per particle (linked list)": "A", "B — per bucket (shared mem)": "B" },
   });
@@ -73,7 +71,35 @@ async function boot() {
   const onSize = (ev: { last: boolean }) => { if (ev.last) engine.rebuild(); };
   fSize.addBinding(params, "minSize", { min: 0.002, max: 0.02, step: 0.001 }).on("change", onSize);
   fSize.addBinding(params, "maxSize", { min: 0.004, max: 0.03, step: 0.001 }).on("change", onSize);
+  pane.addBinding(params, "showGrid", { label: "grid overlay" });
   pane.addBinding(params, "paused");
+
+  // ---- metrics pane (top-left) ------------------------------------------
+  const m = {
+    fps: 0, frameMs: 0, computeMs: 0,
+    jsHeapMB: 0, gpuMemMB: 0,
+    cells: 0, occupied: 0, occupiedPct: 0, avgPerCell: 0, maxPerCell: 0, overflow: 0,
+  };
+  const metWrap = document.createElement("div");
+  metWrap.style.cssText = "position:fixed;top:10px;left:10px;z-index:20;display:none;width:280px;";
+  document.body.appendChild(metWrap);
+  const met = new Pane({ container: metWrap, title: "metrics" });
+
+  met.addBinding(m, "fps", { readonly: true, view: "graph", min: 0, max: 165 });
+  met.addBinding(m, "frameMs", { readonly: true, view: "graph", min: 0, max: 33, label: "frame ms (cpu)" });
+  if (engine.canTimestamp) {
+    met.addBinding(m, "computeMs", { readonly: true, view: "graph", min: 0, max: 8, label: "compute ms (gpu)" });
+  }
+  const fMem = met.addFolder({ title: "memory" });
+  if (hasHeap) fMem.addBinding(m, "jsHeapMB", { readonly: true, format: (v: number) => v.toFixed(1) + " MB", label: "js heap" });
+  fMem.addBinding(m, "gpuMemMB", { readonly: true, format: (v: number) => v.toFixed(1) + " MB", label: "gpu buffers" });
+  const fGrid = met.addFolder({ title: "grid occupancy" });
+  fGrid.addBinding(m, "cells", { readonly: true, format: (v: number) => v.toFixed(0) });
+  fGrid.addBinding(m, "occupied", { readonly: true, format: (v: number) => v.toFixed(0) });
+  fGrid.addBinding(m, "occupiedPct", { readonly: true, format: (v: number) => v.toFixed(1) + " %", label: "occupied %" });
+  fGrid.addBinding(m, "avgPerCell", { readonly: true, format: (v: number) => v.toFixed(2), label: "avg / occ cell" });
+  fGrid.addBinding(m, "maxPerCell", { readonly: true, format: (v: number) => v.toFixed(0), label: "max / cell" });
+  fGrid.addBinding(m, "overflow", { readonly: true, format: (v: number) => v.toFixed(0), label: "overflow (B drops)" });
 
   // ---- "/" toggles debug ------------------------------------------------
   let debug = false;
@@ -81,24 +107,38 @@ async function boot() {
     if (e.key === "/") {
       e.preventDefault();
       debug = !debug;
-      wrap.style.display = debug ? "block" : "none";
+      ctrlWrap.style.display = debug ? "block" : "none";
+      metWrap.style.display = debug ? "block" : "none";
+      engine.collectStats = debug; // only run stat passes while panel is open
     }
   });
 
   // ---- main loop --------------------------------------------------------
   let last = performance.now();
-  let acc = 0, frames = 0;
+  let acc = 0, frames = 0, frameMsSmooth = 0;
   function loop(now: number) {
     const dt = (now - last) / 1000;
     last = now;
+    frameMsSmooth = frameMsSmooth * 0.9 + dt * 1000 * 0.1;
     engine.frame(dt);
 
     acc += dt; frames++;
     if (acc >= 0.25) {
-      stats.fps = frames / acc;
-      stats.computeMs = engine.gpuMs;
+      if (debug) {
+        m.fps = frames / acc;
+        m.frameMs = frameMsSmooth;
+        m.computeMs = engine.gpuMs;
+        if (hasHeap) m.jsHeapMB = (performance as any).memory.usedJSHeapSize / 1048576;
+        m.gpuMemMB = engine.gpuBytes / 1048576;
+        m.cells = engine.numCells;
+        m.occupied = engine.occupied;
+        m.occupiedPct = engine.numCells ? (engine.occupied / engine.numCells) * 100 : 0;
+        m.avgPerCell = engine.occupied ? params.numParticles / engine.occupied : 0;
+        m.maxPerCell = engine.maxCell;
+        m.overflow = engine.overflow;
+        met.refresh();
+      }
       acc = 0; frames = 0;
-      pane.refresh();
     }
     requestAnimationFrame(loop);
   }

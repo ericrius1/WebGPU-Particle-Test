@@ -10,6 +10,9 @@ import {
   BIN_B_WGSL,
   COLLIDE_B_WGSL,
   RENDER_WGSL,
+  CLEAR_STAT_WGSL,
+  BIN_STAT_WGSL,
+  OVERLAY_WGSL,
 } from "./shaders";
 
 export type Mode = "A" | "B";
@@ -25,6 +28,7 @@ export interface SimParams {
   maxSize: number;
   coverage: number; // target fraction of the box covered by particles (density)
   paused: boolean;
+  showGrid: boolean; // grid occupancy overlay
 }
 
 const PARTICLE_FLOATS = 6; // pos.xy, speed.xy, size, temp
@@ -59,6 +63,11 @@ export class Engine {
   private cellPartBuf!: GPUBuffer;
   private occupiedBuf!: GPUBuffer;
   private dispatchBuf!: GPUBuffer;
+  // occupancy stats (overlay + metrics)
+  private statCountBuf!: GPUBuffer;
+  private statMetaBuf!: GPUBuffer;
+  private statResultBuf!: GPUBuffer;
+  private statPending = false;
 
   // pipelines
   private pIntegrate!: GPUComputePipeline;
@@ -69,7 +78,10 @@ export class Engine {
   private pClearB!: GPUComputePipeline;
   private pBinB!: GPUComputePipeline;
   private pCollideB!: GPUComputePipeline;
+  private pClearStat!: GPUComputePipeline;
+  private pBinStat!: GPUComputePipeline;
   private pRender!: GPURenderPipeline;
+  private pOverlay!: GPURenderPipeline;
 
   // layouts
   private bglSim!: GPUBindGroupLayout;
@@ -77,6 +89,8 @@ export class Engine {
   private bglB!: GPUBindGroupLayout;
   private bglBCollide!: GPUBindGroupLayout;
   private bglRender!: GPUBindGroupLayout;
+  private bglStat!: GPUBindGroupLayout;
+  private bglOverlay!: GPUBindGroupLayout;
 
   // bind groups
   private bgSim!: GPUBindGroup;
@@ -84,6 +98,8 @@ export class Engine {
   private bgB!: GPUBindGroup;
   private bgBCollide!: GPUBindGroup;
   private bgRender!: GPUBindGroup;
+  private bgStat!: GPUBindGroup;
+  private bgOverlay!: GPUBindGroup;
 
   private constArray = new ArrayBuffer(48);
   private constU32 = new Uint32Array(this.constArray);
@@ -96,6 +112,13 @@ export class Engine {
   private tsResolve?: GPUBuffer;
   private tsResult?: GPUBuffer;
   private tsPending = false;
+
+  // metrics surfaced to the UI
+  collectStats = false; // only run stat passes when the debug panel is open
+  gpuBytes = 0;
+  occupied = 0;
+  maxCell = 0;
+  overflow = 0;
 
   constructor(device: GPUDevice, ctx: GPUCanvasContext, format: GPUTextureFormat, params: SimParams) {
     this.device = device;
@@ -152,6 +175,17 @@ export class Engine {
         { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
       ],
     });
+    this.bglStat = d.createBindGroupLayout({
+      entries: [
+        buf(0, "uniform"), buf(1, "read-only-storage"), buf(2, "storage"), buf(3, "storage"),
+      ],
+    });
+    this.bglOverlay = d.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      ],
+    });
   }
 
   private compute(code: string, layout: GPUBindGroupLayout): GPUComputePipeline {
@@ -172,6 +206,8 @@ export class Engine {
     this.pClearB = this.compute(CLEAR_B_WGSL, this.bglB);
     this.pBinB = this.compute(BIN_B_WGSL, this.bglB);
     this.pCollideB = this.compute(COLLIDE_B_WGSL, this.bglBCollide);
+    this.pClearStat = this.compute(CLEAR_STAT_WGSL, this.bglStat);
+    this.pBinStat = this.compute(BIN_STAT_WGSL, this.bglStat);
 
     const mod = d.createShaderModule({ code: RENDER_WGSL });
     this.pRender = d.createRenderPipeline({
@@ -179,6 +215,26 @@ export class Engine {
       vertex: { module: mod, entryPoint: "vs" },
       fragment: {
         module: mod,
+        entryPoint: "fs",
+        targets: [
+          {
+            format: this.format,
+            blend: {
+              color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+              alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+            },
+          },
+        ],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+
+    const omod = d.createShaderModule({ code: OVERLAY_WGSL });
+    this.pOverlay = d.createRenderPipeline({
+      layout: d.createPipelineLayout({ bindGroupLayouts: [this.bglOverlay] }),
+      vertex: { module: omod, entryPoint: "vs" },
+      fragment: {
+        module: omod,
         entryPoint: "fs",
         targets: [
           {
@@ -221,7 +277,7 @@ export class Engine {
     for (const b of [
       this.constBuf, this.particleBuf, this.newSpeedBuf, this.newTempBuf,
       this.gridHeadBuf, this.gridNextBuf, this.cellCountBuf, this.cellPartBuf,
-      this.occupiedBuf, this.dispatchBuf,
+      this.occupiedBuf, this.dispatchBuf, this.statCountBuf, this.statMetaBuf,
     ]) b?.destroy?.();
 
     this.constBuf = d.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -261,6 +317,20 @@ export class Engine {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST,
     });
 
+    // occupancy stats
+    this.statCountBuf = d.createBuffer({ size: this.numCells * 4, usage: GPUBufferUsage.STORAGE });
+    this.statMetaBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    if (!this.statResultBuf) {
+      this.statResultBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    }
+
+    // rough GPU memory footprint of the sim buffers
+    this.gpuBytes =
+      N * PARTICLE_BYTES + N * 12 + // particles + newSpeed + newTemp
+      this.numCells * 4 + N * 4 +  // grid A
+      this.numCells * (4 + MAX_PER_CELL * 4 + 4) + 12 + // grid B
+      this.numCells * 4 + 16;       // stats
+
     // bind groups
     const e = (binding: number, buffer: GPUBuffer) => ({ binding, resource: { buffer } });
     this.bgSim = d.createBindGroup({
@@ -292,6 +362,14 @@ export class Engine {
       layout: this.bglRender,
       entries: [e(0, this.constBuf), e(1, this.particleBuf)],
     });
+    this.bgStat = d.createBindGroup({
+      layout: this.bglStat,
+      entries: [e(0, this.constBuf), e(1, this.particleBuf), e(2, this.statCountBuf), e(3, this.statMetaBuf)],
+    });
+    this.bgOverlay = d.createBindGroup({
+      layout: this.bglOverlay,
+      entries: [e(0, this.constBuf), e(1, this.statCountBuf)],
+    });
   }
 
   setAspect(a: number) { this.aspect = a; }
@@ -309,6 +387,24 @@ export class Engine {
     const out: number[][] = [];
     for (let i = 0; i < n; i++) out.push(Array.from(f.subarray(i * PARTICLE_FLOATS, i * PARTICLE_FLOATS + PARTICLE_FLOATS)));
     return out;
+  }
+
+  async debugStat(): Promise<{ meta: number[]; countSum: number; countNonZero: number }> {
+    const d = this.device;
+    const metaStg = d.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const cntBytes = this.numCells * 4;
+    const cntStg = d.createBuffer({ size: cntBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = d.createCommandEncoder();
+    enc.copyBufferToBuffer(this.statMetaBuf, 0, metaStg, 0, 16);
+    enc.copyBufferToBuffer(this.statCountBuf, 0, cntStg, 0, cntBytes);
+    d.queue.submit([enc.finish()]);
+    await Promise.all([metaStg.mapAsync(GPUMapMode.READ), cntStg.mapAsync(GPUMapMode.READ)]);
+    const meta = Array.from(new Uint32Array(metaStg.getMappedRange().slice(0)));
+    const cnt = new Uint32Array(cntStg.getMappedRange().slice(0));
+    let sum = 0, nz = 0;
+    for (let i = 0; i < cnt.length; i++) { sum += cnt[i]; if (cnt[i] > 0) nz++; }
+    metaStg.unmap(); metaStg.destroy(); cntStg.unmap(); cntStg.destroy();
+    return { meta, countSum: sum, countNonZero: nz };
   }
 
   private writeConstants(dt: number) {
@@ -384,18 +480,49 @@ export class Engine {
       }
     }
 
+    // occupancy stats for overlay + metrics (not part of the timed region)
+    const doStats = this.collectStats;
+    if (doStats) {
+      const sp = enc.beginComputePass();
+      sp.setBindGroup(0, this.bgStat);
+      sp.setPipeline(this.pClearStat); sp.dispatchWorkgroups(Math.max(Math.ceil(this.numCells / WG), 1));
+      sp.setPipeline(this.pBinStat); sp.dispatchWorkgroups(Math.ceil(p.numParticles / WG));
+      sp.end();
+      if (!this.statPending) {
+        enc.copyBufferToBuffer(this.statMetaBuf, 0, this.statResultBuf!, 0, 16);
+      }
+    }
+
     const view = this.ctx.getCurrentTexture().createView();
     const rp = enc.beginRenderPass({
       colorAttachments: [
         { view, clearValue: { r: 0.62, g: 0.62, b: 0.62, a: 1 }, loadOp: "clear", storeOp: "store" },
       ],
     });
+    if (p.showGrid && doStats) {
+      rp.setPipeline(this.pOverlay);
+      rp.setBindGroup(0, this.bgOverlay);
+      rp.draw(6, this.numCells);
+    }
     rp.setPipeline(this.pRender);
     rp.setBindGroup(0, this.bgRender);
     rp.draw(6, p.numParticles);
     rp.end();
 
     d.queue.submit([enc.finish()]);
+
+    if (doStats && !this.statPending) {
+      this.statPending = true;
+      const rb = this.statResultBuf!;
+      rb.mapAsync(GPUMapMode.READ).then(() => {
+        const m = new Uint32Array(rb.getMappedRange().slice(0));
+        this.occupied = m[0];
+        this.maxCell = m[1];
+        this.overflow = m[2];
+        rb.unmap();
+        this.statPending = false;
+      }).catch(() => { this.statPending = false; });
+    }
 
     if (ts && !p.paused) {
       this.tsPending = true;

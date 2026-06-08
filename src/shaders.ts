@@ -342,3 +342,97 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
   return vec4<f32>(heatColor(in.temp), alpha);
 }
 `;
+
+// =========================================================================
+// Occupancy stats — mode-independent per-cell counts for the grid overlay
+// and the metrics panel. Runs only when the debug panel is open.
+// =========================================================================
+
+const BIND_STAT = /* wgsl */ `
+@group(0) @binding(0) var<uniform> C : Constants;
+@group(0) @binding(1) var<storage, read> particles : array<Particle>;
+@group(0) @binding(2) var<storage, read_write> statCount : array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> statMeta  : array<atomic<u32>>; // [occupied,max,overflow,_]
+`;
+
+export const CLEAR_STAT_WGSL = COMMON + BIND_STAT + /* wgsl */ `
+@compute @workgroup_size(${WG})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i == 0u) {
+    atomicStore(&statMeta[0], 0u);
+    atomicStore(&statMeta[1], 0u);
+    atomicStore(&statMeta[2], 0u);
+    atomicStore(&statMeta[3], 0u);
+  }
+  if (i >= C.gridW * C.gridH) { return; }
+  atomicStore(&statCount[i], 0u);
+}
+`;
+
+export const BIN_STAT_WGSL = COMMON + BIND_STAT + /* wgsl */ `
+@compute @workgroup_size(${WG})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= C.numParticles) { return; }
+  let cell = cellIndex(cellCoord(particles[i].pos));
+  let old = atomicAdd(&statCount[cell], 1u);
+  if (old == 0u) { atomicAdd(&statMeta[0], 1u); }       // occupied cells
+  atomicMax(&statMeta[1], old + 1u);                     // max per cell
+  if (old >= C.maxPerCell) { atomicAdd(&statMeta[2], 1u); } // overflow (dropped in B)
+}
+`;
+
+// =========================================================================
+// Grid overlay — one instanced quad per cell, tinted by occupancy + grid lines
+// =========================================================================
+
+export const OVERLAY_WGSL = COMMON + /* wgsl */ `
+@group(0) @binding(0) var<uniform> C : Constants;
+@group(0) @binding(1) var<storage, read> statCount : array<u32>;
+
+struct VSOut {
+  @builtin(position) clip : vec4<f32>,
+  @location(0) uv  : vec2<f32>,
+  @location(1) occ : f32,
+};
+
+fn fit(c: vec2<f32>) -> vec2<f32> {
+  var o = c;
+  if (C.aspect > 1.0) { o.x /= C.aspect; } else { o.y *= C.aspect; }
+  return o;
+}
+fn heatColor(t: f32) -> vec3<f32> {
+  let x = clamp(t, 0.0, 1.0);
+  return mix(vec3<f32>(0.10, 0.45, 0.95), vec3<f32>(0.98, 0.30, 0.15), x);
+}
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VSOut {
+  let corners = array<vec2<f32>, 6>(
+    vec2(0.0,0.0), vec2(1.0,0.0), vec2(0.0,1.0),
+    vec2(0.0,1.0), vec2(1.0,0.0), vec2(1.0,1.0));
+  let q = corners[vi];
+  let cx = f32(inst % C.gridW);
+  let cy = f32(inst / C.gridW);
+  let world = (vec2<f32>(cx, cy) + q) * C.cellSize;
+  let vh = C.viewSize * 0.5;
+  let half = C.worldSize * 0.5;
+  var out: VSOut;
+  out.clip = vec4<f32>(fit((world - vec2<f32>(half)) / vh), 0.0, 1.0);
+  out.uv  = q;
+  out.occ = f32(statCount[inst]) / f32(C.maxPerCell);
+  return out;
+}
+
+@fragment
+fn fs(in: VSOut) -> @location(0) vec4<f32> {
+  let t = clamp(in.occ, 0.0, 1.0);
+  let edge = min(min(in.uv.x, 1.0 - in.uv.x), min(in.uv.y, 1.0 - in.uv.y));
+  let line = 1.0 - smoothstep(0.0, 0.04, edge);     // grid line near cell border
+  let fillA = select(0.0, 0.12 + 0.5 * t, in.occ > 0.0);
+  let col = mix(heatColor(t), vec3<f32>(0.05, 0.05, 0.08), line);
+  let a = max(fillA, line * 0.30);
+  return vec4<f32>(col, a);
+}
+`;
