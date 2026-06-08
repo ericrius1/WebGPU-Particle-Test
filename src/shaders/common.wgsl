@@ -31,6 +31,8 @@ struct Constants {
   worldSize    : f32,
   viewSize     : f32,        // side of the on-screen window into the world (camera zoom)
   viewCenter   : vec2<f32>,  // world point at the centre of the screen (camera pan)
+  mode         : u32,        // 0 = A (linked list), 1 = B (bucket) — overlay only
+  maxObs       : f32,        // observed max particles/cell last frame — overlay scale for A
 };
 
 fn cellCoord(p: vec2<f32>) -> vec2<i32> {

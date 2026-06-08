@@ -430,6 +430,8 @@ export class Engine {
     f[11] = this.viewSize;
     f[12] = this.viewCenterX;
     f[13] = this.viewCenterY;
+    u[14] = p.mode === "B" ? 1 : 0;        // overlay: which algorithm is live
+    f[15] = this.maxCell;                  // overlay: A scales heat by observed max/cell
     this.device.queue.writeBuffer(this.constBuf, 0, this.constArray);
   }
 

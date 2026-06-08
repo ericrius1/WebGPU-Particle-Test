@@ -18,20 +18,38 @@ async function boot() {
   const format = navigator.gpu.getPreferredCanvasFormat();
   ctx.configure({ device, format, alphaMode: "opaque" });
 
-  const params: SimParams = {
-    mode: "A",
-    numParticles: 8000,
-    speed: 1.0,
-    restitution: 1.0,
-    tempGain: 0.012,
-    tempDecay: 0.92,
-    minSize: 0.004,
-    maxSize: 0.011,
-    coverage: 0.08,
-    cellScale: 1.0,
-    paused: false,
-    showGrid: false,
+  // ---- single source of truth for every tunable -------------------------
+  // each control's default `value` lives right next to its slider range
+  // (min/max/step) and behavior. edit a value here and the range is in reach.
+  //   target "engine": binds to the engine instead of params
+  //   rebuild "last":   rebuild on slider release; "always": rebuild every change
+  type Control = {
+    key: string;
+    value?: string | number | boolean;
+    target?: "engine";
+    folder?: string;
+    rebuild?: "last" | "always";
+    opts?: Record<string, unknown>;
   };
+  const CONTROLS: Control[] = [
+    { key: "mode", value: "A", opts: { options: { "A — per particle (linked list)": "A", "B — per bucket (shared mem)": "B" } } },
+    { key: "numParticles", value: 8000, rebuild: "last", opts: { min: 100, max: 40000, step: 100 } },
+    { key: "coverage", value: 0.08, rebuild: "last", opts: { min: 0.02, max: 0.3, step: 0.01, label: "density" } },
+    { key: "cellScale", value: 1.0, rebuild: "always", opts: { min: 1, max: 8, step: 0.5, label: "grid cell ×" } },
+    { key: "viewSize", target: "engine", opts: { min: 0.1, max: 6, step: 0.05, label: "zoom (view)" } },
+    { key: "speed", value: 1.0, opts: { min: 0, max: 3, step: 0.05 } },
+    { key: "restitution", value: 1.0, opts: { min: 0, max: 1, step: 0.02 } },
+    { key: "tempGain", value: 0.012, opts: { min: 0, max: 0.3, step: 0.005 } },
+    { key: "tempDecay", value: 0.92, opts: { min: 0.8, max: 1, step: 0.005 } },
+    { key: "minSize", value: 0.004, folder: "particle size", rebuild: "last", opts: { min: 0.002, max: 0.02, step: 0.001 } },
+    { key: "maxSize", value: 0.011, folder: "particle size", rebuild: "last", opts: { min: 0.004, max: 0.03, step: 0.001 } },
+    { key: "showGrid", value: false, opts: { label: "grid overlay" } },
+    { key: "paused", value: false },
+  ];
+
+  const params = Object.fromEntries(
+    CONTROLS.filter((c) => c.value !== undefined).map((c) => [c.key, c.value]),
+  ) as unknown as SimParams;
 
   const engine = new Engine(device, ctx, format, params);
   (window as any).engine = engine;
@@ -54,29 +72,18 @@ async function boot() {
   document.body.appendChild(ctrlWrap);
   const pane = new Pane({ container: ctrlWrap, title: "controls" });
 
-  const modeBinding = pane.addBinding(params, "mode", {
-    options: { "A — per particle (linked list)": "A", "B — per bucket (shared mem)": "B" },
-  });
-  pane.addBinding(params, "numParticles", { min: 100, max: 40000, step: 100 }).on("change", (ev) => {
-    if (ev.last) engine.rebuild();
-  });
-  pane.addBinding(params, "coverage", { min: 0.02, max: 0.3, step: 0.01, label: "density" }).on("change", (ev) => {
-    if (ev.last) engine.rebuild();
-  });
-  pane.addBinding(params, "cellScale", { min: 1, max: 8, step: 0.5, label: "grid cell ×" }).on("change", (ev) => {
-    if (ev.last) engine.rebuild();
-  });
-  pane.addBinding(engine, "viewSize", { min: 0.1, max: 6, step: 0.05, label: "zoom (view)" });
-  pane.addBinding(params, "speed", { min: 0, max: 3, step: 0.05 });
-  pane.addBinding(params, "restitution", { min: 0, max: 1, step: 0.02 });
-  pane.addBinding(params, "tempGain", { min: 0, max: 0.3, step: 0.005 });
-  pane.addBinding(params, "tempDecay", { min: 0.8, max: 1, step: 0.005 });
-  const fSize = pane.addFolder({ title: "particle size", expanded: false });
-  const onSize = (ev: { last: boolean }) => { if (ev.last) engine.rebuild(); };
-  fSize.addBinding(params, "minSize", { min: 0.002, max: 0.02, step: 0.001 }).on("change", onSize);
-  fSize.addBinding(params, "maxSize", { min: 0.004, max: 0.03, step: 0.001 }).on("change", onSize);
-  pane.addBinding(params, "showGrid", { label: "grid overlay" });
-  pane.addBinding(params, "paused");
+  const folders: Record<string, any> = {};
+  let modeBinding: any;
+  for (const c of CONTROLS) {
+    const obj = c.target === "engine" ? engine : params;
+    const parent = c.folder
+      ? (folders[c.folder] ??= pane.addFolder({ title: c.folder, expanded: false }))
+      : pane;
+    const b = parent.addBinding(obj, c.key, c.opts ?? {});
+    if (c.rebuild === "last") b.on("change", (ev: { last: boolean }) => { if (ev.last) engine.rebuild(); });
+    else if (c.rebuild === "always") b.on("change", () => engine.rebuild());
+    if (c.key === "mode") modeBinding = b;
+  }
 
   // ---- metrics pane (top-left) ------------------------------------------
   const m = {
