@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebGPU Particles — Spatial Hash Collisions</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0a0a0f; overflow: hidden; }
+      #gpu-canvas { display: block; width: 100vw; height: 100vh; }
+      #hint {
+        position: fixed; left: 12px; bottom: 10px; z-index: 10;
+        font: 12px ui-monospace, monospace; color: #6b7280;
+        pointer-events: none; user-select: none;
+      }
+      #nowebgpu {
+        position: fixed; inset: 0; display: none; place-items: center;
+        font: 16px ui-monospace, monospace; color: #f87171; text-align: center; padding: 2rem;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="gpu-canvas"></canvas>
+    <div id="hint">press <b>/</b> for debug panel</div>
+    <div id="nowebgpu">WebGPU not available. Use Chrome/Edge 113+ or a WebGPU-enabled browser.</div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
