@@ -28,6 +28,7 @@ async function boot() {
     minSize: 0.004,
     maxSize: 0.011,
     coverage: 0.08,
+    cellScale: 1.0,
     paused: false,
     showGrid: false,
   };
@@ -53,7 +54,7 @@ async function boot() {
   document.body.appendChild(ctrlWrap);
   const pane = new Pane({ container: ctrlWrap, title: "controls" });
 
-  pane.addBinding(params, "mode", {
+  const modeBinding = pane.addBinding(params, "mode", {
     options: { "A — per particle (linked list)": "A", "B — per bucket (shared mem)": "B" },
   });
   pane.addBinding(params, "numParticles", { min: 100, max: 40000, step: 100 }).on("change", (ev) => {
@@ -62,7 +63,10 @@ async function boot() {
   pane.addBinding(params, "coverage", { min: 0.02, max: 0.3, step: 0.01, label: "density" }).on("change", (ev) => {
     if (ev.last) engine.rebuild();
   });
-  pane.addBinding(engine, "viewSize", { min: 0.3, max: 4, step: 0.05, label: "zoom (view)" });
+  pane.addBinding(params, "cellScale", { min: 1, max: 8, step: 0.5, label: "grid cell ×" }).on("change", (ev) => {
+    if (ev.last) engine.rebuild();
+  });
+  pane.addBinding(engine, "viewSize", { min: 0.1, max: 6, step: 0.05, label: "zoom (view)" });
   pane.addBinding(params, "speed", { min: 0, max: 3, step: 0.05 });
   pane.addBinding(params, "restitution", { min: 0, max: 1, step: 0.02 });
   pane.addBinding(params, "tempGain", { min: 0, max: 0.3, step: 0.005 });
@@ -101,7 +105,7 @@ async function boot() {
   fGrid.addBinding(m, "maxPerCell", { readonly: true, format: (v: number) => v.toFixed(0), label: "max / cell" });
   fGrid.addBinding(m, "overflow", { readonly: true, format: (v: number) => v.toFixed(0), label: "overflow (B drops)" });
 
-  // ---- "/" toggles debug ------------------------------------------------
+  // ---- keys: "/" debug, "M" toggle mode ---------------------------------
   let debug = false;
   window.addEventListener("keydown", (e) => {
     if (e.key === "/") {
@@ -110,8 +114,54 @@ async function boot() {
       ctrlWrap.style.display = debug ? "block" : "none";
       metWrap.style.display = debug ? "block" : "none";
       engine.collectStats = debug; // only run stat passes while panel is open
+    } else if (e.key === "m" || e.key === "M") {
+      params.mode = params.mode === "A" ? "B" : "A";
+      modeBinding.refresh();
     }
   });
+
+  // ---- camera: drag to pan, wheel / pinch to zoom -----------------------
+  // screen pixel -> world coords using the current camera (optionally a custom zoom)
+  function screenToWorld(px: number, py: number, vs = engine.viewSize): [number, number] {
+    const aspect = canvas.width / canvas.height;
+    const ndcX = (px / window.innerWidth) * 2 - 1;
+    const ndcY = 1 - (py / window.innerHeight) * 2;
+    const vh = vs * 0.5;
+    const wx = engine.viewCenterX + ndcX * vh * (aspect > 1 ? aspect : 1);
+    const wy = engine.viewCenterY + ndcY * vh * (aspect > 1 ? 1 : 1 / aspect);
+    return [wx, wy];
+  }
+
+  let dragging = false;
+  let lastPx = 0, lastPy = 0;
+  canvas.addEventListener("pointerdown", (e) => {
+    dragging = true; lastPx = e.clientX; lastPy = e.clientY;
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const [wx0, wy0] = screenToWorld(lastPx, lastPy);
+    const [wx1, wy1] = screenToWorld(e.clientX, e.clientY);
+    engine.viewCenterX -= wx1 - wx0; // content follows the cursor
+    engine.viewCenterY -= wy1 - wy0;
+    lastPx = e.clientX; lastPy = e.clientY;
+  });
+  const endDrag = (e: PointerEvent) => { dragging = false; canvas.releasePointerCapture?.(e.pointerId); };
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    // trackpad pinch arrives as ctrlKey+wheel; normal wheel also zooms
+    const factor = Math.exp(e.deltaY * (e.ctrlKey ? 0.01 : 0.0015));
+    const newVs = Math.min(Math.max(engine.viewSize * factor, 0.05), engine.worldSize * 2);
+    // keep the world point under the cursor fixed
+    const [wx, wy] = screenToWorld(e.clientX, e.clientY, engine.viewSize);
+    const [wx2, wy2] = screenToWorld(e.clientX, e.clientY, newVs);
+    engine.viewCenterX += wx - wx2;
+    engine.viewCenterY += wy - wy2;
+    engine.viewSize = newVs;
+  }, { passive: false });
 
   // ---- main loop --------------------------------------------------------
   let last = performance.now();

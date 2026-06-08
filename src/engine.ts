@@ -27,6 +27,7 @@ export interface SimParams {
   minSize: number;
   maxSize: number;
   coverage: number; // target fraction of the box covered by particles (density)
+  cellScale: number; // grid cell size multiplier (1 = fits largest particle)
   paused: boolean;
   showGrid: boolean; // grid occupancy overlay
 }
@@ -49,6 +50,8 @@ export class Engine {
   cellSize = 0.02;
   worldSize = 1; // side length of the square sim box (grows with particle count)
   viewSize = 0.75; // on-screen window into the world; keeps particles big like the reference
+  viewCenterX = 0.5; // camera pan (world coords); reset to world centre on rebuild
+  viewCenterY = 0.5;
 
   // buffers
   private constBuf!: GPUBuffer;
@@ -101,7 +104,7 @@ export class Engine {
   private bgStat!: GPUBindGroup;
   private bgOverlay!: GPUBindGroup;
 
-  private constArray = new ArrayBuffer(48);
+  private constArray = new ArrayBuffer(64);
   private constU32 = new Uint32Array(this.constArray);
   private constF32 = new Float32Array(this.constArray);
 
@@ -266,9 +269,13 @@ export class Engine {
     }
     this.worldSize = Math.max(Math.sqrt(area / Math.max(this.params.coverage, 0.01)), 4 * this.params.maxSize);
     const L = this.worldSize;
+    // recentre the camera on the (resized) world
+    this.viewCenterX = L * 0.5;
+    this.viewCenterY = L * 0.5;
+    this.viewSize = Math.min(this.viewSize, L);
 
     // grid: cell must fit the largest particle (diameter = 2*maxSize)
-    this.cellSize = Math.max(2 * this.params.maxSize, 1e-3);
+    this.cellSize = Math.max(2 * this.params.maxSize * this.params.cellScale, 1e-3);
     this.gridW = Math.max(1, Math.floor(L / this.cellSize));
     this.gridH = this.gridW;
     this.numCells = this.gridW * this.gridH;
@@ -280,7 +287,7 @@ export class Engine {
       this.occupiedBuf, this.dispatchBuf, this.statCountBuf, this.statMetaBuf,
     ]) b?.destroy?.();
 
-    this.constBuf = d.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.constBuf = d.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
     const init = new Float32Array(N * PARTICLE_FLOATS);
     for (let i = 0; i < N; i++) {
@@ -420,7 +427,9 @@ export class Engine {
     f[8] = p.tempGain;
     f[9] = p.restitution;
     f[10] = this.worldSize;
-    f[11] = Math.min(this.viewSize, this.worldSize);
+    f[11] = this.viewSize;
+    f[12] = this.viewCenterX;
+    f[13] = this.viewCenterY;
     this.device.queue.writeBuffer(this.constBuf, 0, this.constArray);
   }
 
