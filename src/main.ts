@@ -33,7 +33,7 @@ async function boot() {
   };
   const CONTROLS: Control[] = [
     { key: "mode", value: "A", opts: { options: { "A — per particle (linked list)": "A", "B — per bucket (shared mem)": "B" } } },
-    { key: "numParticles", value: 8000, rebuild: "last", opts: { min: 100, max: 40000, step: 100 } },
+    { key: "numParticles", value: 8000, rebuild: "last", opts: { min: 100, max: 400000, step: 100 } },
     { key: "coverage", value: 0.08, rebuild: "last", opts: { min: 0.02, max: 0.3, step: 0.01, label: "density" } },
     { key: "cellScale", value: 1.0, rebuild: "always", opts: { min: 1, max: 8, step: 0.5, label: "grid cell ×" } },
     { key: "viewSize", target: "engine", opts: { min: 0.1, max: 6, step: 0.05, label: "zoom (view)" } },
