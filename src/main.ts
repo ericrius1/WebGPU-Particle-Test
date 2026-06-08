@@ -89,10 +89,15 @@ async function boot() {
   document.body.appendChild(metWrap);
   const met = new Pane({ container: metWrap, title: "metrics" });
 
-  met.addBinding(m, "fps", { readonly: true, view: "graph", min: 0, max: 165 });
-  met.addBinding(m, "frameMs", { readonly: true, view: "graph", min: 0, max: 33, label: "frame ms (cpu)" });
+  // each metric: a numeric readout (graph view only shows the value on hover)
+  // followed by the graph itself with a blank label so they read as one row.
+  met.addBinding(m, "fps", { readonly: true, format: (v: number) => v.toFixed(0) });
+  met.addBinding(m, "fps", { readonly: true, view: "graph", min: 0, max: 165, label: " " });
+  met.addBinding(m, "frameMs", { readonly: true, format: (v: number) => v.toFixed(1) + " ms", label: "frame ms (cpu)" });
+  met.addBinding(m, "frameMs", { readonly: true, view: "graph", min: 0, max: 33, label: " " });
   if (engine.canTimestamp) {
-    met.addBinding(m, "computeMs", { readonly: true, view: "graph", min: 0, max: 8, label: "compute ms (gpu)" });
+    met.addBinding(m, "computeMs", { readonly: true, format: (v: number) => v.toFixed(2) + " ms", label: "compute ms (gpu)" });
+    met.addBinding(m, "computeMs", { readonly: true, view: "graph", min: 0, max: 8, label: " " });
   }
   const fMem = met.addFolder({ title: "memory" });
   if (hasHeap) fMem.addBinding(m, "jsHeapMB", { readonly: true, format: (v: number) => v.toFixed(1) + " MB", label: "js heap" });
