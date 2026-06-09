@@ -1,7 +1,8 @@
-const WG           : u32 = 64;
-const MAX_PER_CELL : u32 = 16;
-const SHARED       : u32 = MAX_PER_CELL * 9u;
-const INVALID      : u32 = 0xffffffffu;
+const WG             : u32 = 64;
+const MAX_PER_CELL   : u32 = 16;
+const SHARED         : u32 = MAX_PER_CELL * 9u;   // 3x3 neighbourhood, one bucket
+const BUCKETS_PER_WG : u32 = 4u;                  // occupied cells handled per workgroup
+const INVALID        : u32 = 0xffffffffu;
 
 struct Particle {
   pos   : vec2<f32>,

@@ -54,40 +54,57 @@ cell to the `occupied` list. That same append counter *is* the `x` of the
 indirect-dispatch buffer — so the collide pass automatically dispatches exactly
 as many workgroups as there are non-empty cells. Empty cells cost nothing.
 
-### collideB — one workgroup per occupied bucket, shared-memory neighbours
+### collideB — many occupied buckets per workgroup, compact shared staging
 
 Dispatched indirectly: `dispatchWorkgroupsIndirect(dispatchBuf, 0)`. Workgroup
-size = `MAX_PER_CELL`, so there is one thread per bucket slot.
+size = `MAX_PER_CELL * BUCKETS_PER_WG` (= 16 * 4 = **64**), so one workgroup
+chews `BUCKETS_PER_WG` occupied cells at once. Lane `lid` splits into
+`b = lid / MAX_PER_CELL` (which bucket) and `slot = lid % MAX_PER_CELL` (slot
+within it). `fixB` therefore dispatches `ceil(occupied / BUCKETS_PER_WG)`
+workgroups, not one per cell.
+
+Two deliberate choices, both fixing why the naive one-bucket-per-workgroup
+version *lost* to [mode A](mode-a-linked-list-grid.md):
+
+1. **Pack buckets to fill the wave.** A 16-thread workgroup leaves 1/2–3/4 of
+   every 32/64-lane wave idle, every dispatch, regardless of density. Packing
+   four buckets into a 64-thread workgroup runs the wave full.
+
+2. **Compact the staging — no INVALID holes.** Each lane appends its valid
+   neighbours into bucket `b`'s shared region via a workgroup atomic, so the
+   collide loop walks the *real* neighbour count, not a fixed `9 * MAX_PER_CELL`
+   (= 144) with `continue`-skips. Sparse cells stop paying the full 144.
 
 ```wgsl
-var<workgroup> sPos  : array<vec2<f32>, SHARED>;   // SHARED = MAX_PER_CELL * 9 (the 3x3 nbhd)
-var<workgroup> sVel  : array<vec2<f32>, SHARED>;
-var<workgroup> sSize : array<f32,       SHARED>;
-var<workgroup> sIdx  : array<u32,       SHARED>;   // INVALID marks empty slots
+var<workgroup> sPos   : array<vec2<f32>, SHARED * BUCKETS_PER_WG>;
+var<workgroup> sVel   : array<vec2<f32>, SHARED * BUCKETS_PER_WG>;
+var<workgroup> sSize  : array<f32,       SHARED * BUCKETS_PER_WG>;
+var<workgroup> sIdx   : array<u32,       SHARED * BUCKETS_PER_WG>;
+var<workgroup> sCount : array<atomic<u32>, BUCKETS_PER_WG>;   // compact length per bucket
 
-// 1. Collaboratively stage the 3x3 neighbourhood. Thread `lid` loads slot `lid`
-//    of each of the 9 cells -> 9 * MAX_PER_CELL entries total.
-for (var k = 0u; k < 9u; k++) { /* load cell (cx+dx, cy+dy), slot lid -> sIdx[k*cap+lid] */ }
+// 1. Stage: this lane loads its slot from each of the 9 neighbour cells and
+//    *appends* the valid ones into bucket b's region (atomic bump, no holes).
+let region = b * SHARED;
+for (var k = 0u; k < 9u; k++) {
+  // ... if (slot < cnt) { let d = region + atomicAdd(&sCount[b], 1u); store ... }
+}
 workgroupBarrier();
 
-// 2. "My" particle = slot lid of the centre cell (k = 4).
-let me = sIdx[4u * C.maxPerCell + lid];
-if (me == INVALID) { return; }
+// 2. "My" particle = slot `slot` of the centre cell, loaded direct from global.
+let me = cellParticles[center * C.maxPerCell + slot];
 
-// 3. Collide against every staged neighbour (read from shared memory).
-for (var s = 0u; s < 9u * C.maxPerCell; s++) {
-  let oi = sIdx[s];
-  if (oi == INVALID || oi == me) { continue; }
-  dv += collidePair(mp, mv, mr, sPos[s], sVel[s], sSize[s], &heat);
+// 3. Collide against the compact staged list — real length, not 144.
+let n = atomicLoad(&sCount[b]);
+for (var s = 0u; s < n; s++) {
+  if (sIdx[region + s] == me) { continue; }
+  dv += collidePair(mp, mv, mr, sPos[region+s], sVel[region+s], sSize[region+s], &heat);
 }
-newSpeed[me] = mv + dv;
-newTemp[me]  = particles[me].temp + heat;
 ```
 
-The key win: the `9 * MAX_PER_CELL` (= 144) neighbour entries are read from
-global memory **once**, cooperatively, by the workgroup — then every thread
-collides against the shared copy. In mode A each thread re-reads its neighbours
-independently.
+The key win still holds — each cell's particle data is read from global memory
+**once** by the workgroup, then shared — but now the workgroup is wave-sized and
+the collide loop is occupancy-sized. Shared budget: `4 * 144` entries ×
+(pos 8 + vel 8 + size 4 + idx 4) ≈ **13.8 KB**, under the 16 KB floor.
 
 ## The indirect-buffer pass split (a WebGPU constraint)
 
@@ -105,7 +122,24 @@ their own modules (see [wgsl-module-assembly](wgsl-module-assembly.md)).
 - **Empty cells are free** — never dispatched.
 - **Capacity cap** — drops collisions in cells over `MAX_PER_CELL`. Tune the cap
   to the expected max occupancy; the overlay shows where buckets fill/overflow.
-- **Wins when dense** — the fixed 144-entry shared load amortises over many
-  particles. **Loses when sparse** — every occupied bucket pays the full staging
-  cost even for near-empty neighbourhoods, where [mode A](mode-a-linked-list-grid.md)
-  just walks a couple of short lists.
+- **Full waves** — `BUCKETS_PER_WG` packs the workgroup to 64 lanes, so it does
+  not waste 1/2–3/4 of every wave the way a 16-lane workgroup does.
+- **Occupancy-sized collide** — compact staging walks the real neighbour count,
+  not a flat 144 per particle.
+- **Still loses when sparse** — these two fixes shrink B's overhead but do not
+  remove its fundamental cost: B launches one workgroup per `BUCKETS_PER_WG`
+  *occupied cells* (64 threads each), while [mode A](mode-a-linked-list-grid.md)
+  launches one thread per *particle*. At low occupancy that's a large constant
+  multiple of wasted threads staging near-empty neighbourhoods.
+
+### Measured (1M particles, this machine)
+
+| avg particles / cell | mode A | mode B |
+| --- | --- | --- |
+| 0.2 (sparse, `cellScale` 1) | **4.9 ms** | 21.3 ms |
+| 13 (dense, `cellScale` 8)   | 24.8 ms | **7.3 ms** |
+
+B wins decisively only once cells are near `MAX_PER_CELL` full — exactly where
+the shared-memory reuse amortises. When cells are nearly empty, A's
+one-thread-per-particle walk is unbeatable. Pick the mode to match occupancy
+(raise `cellScale` to make cells fuller).
