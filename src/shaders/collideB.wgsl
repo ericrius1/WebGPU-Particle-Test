@@ -1,5 +1,3 @@
-// one workgroup per occupied bucket; MAX_PER_CELL threads load the 3x3
-// neighbourhood (SHARED entries) into shared memory, then collide.
 var<workgroup> sPos  : array<vec2<f32>, SHARED>;
 var<workgroup> sVel  : array<vec2<f32>, SHARED>;
 var<workgroup> sSize : array<f32,       SHARED>;
@@ -7,13 +5,14 @@ var<workgroup> sIdx  : array<u32,       SHARED>;
 
 @compute @workgroup_size(MAX_PER_CELL)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>,
         @builtin(local_invocation_index) lid: u32) {
-  let cell = occupied[wid.x];
+  let slot = wid.y * nwg.x + wid.x;
+  if (slot >= dispatchArgs[3]) { return; }
+  let cell = occupied[slot];
   let cx = i32(cell % C.gridW);
   let cy = i32(cell / C.gridW);
 
-  // collaboratively stage the 3x3 neighbourhood: thread lid loads slot lid of
-  // each of the 9 cells -> SHARED total entries.
   for (var k = 0u; k < 9u; k++) {
     let dx = i32(k % 3u) - 1;
     let dy = i32(k / 3u) - 1;
@@ -36,7 +35,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
   }
   workgroupBarrier();
 
-  // "my" particle = slot lid of the centre cell (k=4 -> 4*maxPerCell+lid)
   let myStaged = 4u * C.maxPerCell + lid;
   let me = sIdx[myStaged];
   if (me == INVALID) { return; }

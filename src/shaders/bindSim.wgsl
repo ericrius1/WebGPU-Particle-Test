@@ -1,4 +1,3 @@
-// uniform + particle bindings present in most simulation passes
 @group(0) @binding(0) var<uniform> C : Constants;
 @group(0) @binding(1) var<storage, read_write> particles : array<Particle>;
 @group(0) @binding(2) var<storage, read_write> newSpeed  : array<vec2<f32>>;

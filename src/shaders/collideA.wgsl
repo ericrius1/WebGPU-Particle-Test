@@ -1,7 +1,7 @@
-// per particle: walk the 3x3 neighbourhood linked lists.
 @compute @workgroup_size(WG)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) nwg: vec3<u32>) {
+  let i = linearId(gid, nwg);
   if (i >= C.numParticles) { return; }
   let me = particles[i];
   let cc = cellCoord(me.pos);

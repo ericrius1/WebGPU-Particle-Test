@@ -1,13 +1,6 @@
-// Shared declarations prepended to every shader module: struct/uniform defs,
-// grid helpers, and the collision kernel.
-//
-// Compile-time sizes live here as WGSL consts. The JS mirrors in index.ts
-// (WG, MAX_PER_CELL) MUST stay in sync — they drive buffer sizes and dispatch
-// counts on the host side.
-
-const WG           : u32 = 64;                  // workgroup size for per-particle passes
-const MAX_PER_CELL : u32 = 16;                  // bucket capacity for Mode B shared-memory load
-const SHARED       : u32 = MAX_PER_CELL * 9u;   // 3x3 neighbourhood capacity in Mode B
+const WG           : u32 = 64;
+const MAX_PER_CELL : u32 = 16;
+const SHARED       : u32 = MAX_PER_CELL * 9u;
 const INVALID      : u32 = 0xffffffffu;
 
 struct Particle {
@@ -29,11 +22,17 @@ struct Constants {
   tempGain     : f32,
   restitution  : f32,
   worldSize    : f32,
-  viewSize     : f32,        // side of the on-screen window into the world (camera zoom)
-  viewCenter   : vec2<f32>,  // world point at the centre of the screen (camera pan)
-  mode         : u32,        // 0 = A (linked list), 1 = B (bucket) — overlay only
-  maxObs       : f32,        // observed max particles/cell last frame — overlay scale for A
+  viewSize     : f32,
+  viewCenter   : vec2<f32>,
+  mode         : u32,
+  maxObs       : f32,
 };
+
+// Flatten a 2D workgroup grid (used when 1D group count exceeds the
+// 65535 per-dimension dispatch limit) back to a linear thread index.
+fn linearId(gid: vec3<u32>, nwg: vec3<u32>) -> u32 {
+  return gid.y * nwg.x * WG + gid.x;
+}
 
 fn cellCoord(p: vec2<f32>) -> vec2<i32> {
   let g = vec2<i32>(floor(p / C.cellSize));
@@ -43,8 +42,6 @@ fn cellIndex(c: vec2<i32>) -> u32 {
   return u32(c.y) * C.gridW + u32(c.x);
 }
 
-// elastic impulse on particle a from particle b (mass = size^2).
-// returns delta velocity for a; accumulates collision heat into *heat.
 fn collidePair(pa: vec2<f32>, va: vec2<f32>, ra: f32,
                pb: vec2<f32>, vb: vec2<f32>, rb: f32,
                heat: ptr<function, f32>) -> vec2<f32> {
@@ -54,10 +51,9 @@ fn collidePair(pa: vec2<f32>, va: vec2<f32>, ra: f32,
   if (dist2 >= rsum * rsum || dist2 < 1e-12) { return vec2<f32>(0.0); }
   let dist = sqrt(dist2);
   let n = d / dist;
-  // gentle positional push so deep overlaps don't stick and churn impulses
   let sep = n * (rsum - dist) * 1.5;
   let vrel = dot(va - vb, n);
-  if (vrel >= 0.0) { return sep; } // already separating: only de-penetrate
+  if (vrel >= 0.0) { return sep; }
   let ma = ra * ra;
   let mb = rb * rb;
   let j = -(1.0 + C.restitution) * vrel * (mb / (ma + mb));

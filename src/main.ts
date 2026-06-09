@@ -11,6 +11,12 @@ async function boot() {
   const wantTs = adapter.features.has("timestamp-query");
   const device = await adapter.requestDevice({
     requiredFeatures: wantTs ? ["timestamp-query"] : [],
+    // Default limits cap buffers at 256MB; 1M particles needs bigger grid
+    // buffers. Request the most this adapter allows.
+    requiredLimits: {
+      maxBufferSize: adapter.limits.maxBufferSize,
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+    },
   });
   device.lost.then((info) => console.error("device lost:", info.message));
 
@@ -18,11 +24,6 @@ async function boot() {
   const format = navigator.gpu.getPreferredCanvasFormat();
   ctx.configure({ device, format, alphaMode: "opaque" });
 
-  // ---- single source of truth for every tunable -------------------------
-  // each control's default `value` lives right next to its slider range
-  // (min/max/step) and behavior. edit a value here and the range is in reach.
-  //   target "engine": binds to the engine instead of params
-  //   rebuild "last":   rebuild on slider release; "always": rebuild every change
   type Control = {
     key: string;
     value?: string | number | boolean;
@@ -33,11 +34,11 @@ async function boot() {
   };
   const CONTROLS: Control[] = [
     { key: "mode", value: "A", opts: { options: { "A — per particle (linked list)": "A", "B — per bucket (shared mem)": "B" } } },
-    { key: "numParticles", value: 8000, rebuild: "last", opts: { min: 100, max: 400000, step: 100 } },
+    { key: "numParticles", value: 8000, rebuild: "last", opts: { min: 100, max: 1000000, step: 100 } },
     { key: "coverage", value: 0.08, rebuild: "last", opts: { min: 0.02, max: 0.3, step: 0.01, label: "density" } },
     { key: "cellScale", value: 1.0, rebuild: "always", opts: { min: 1, max: 8, step: 0.5, label: "grid cell ×" } },
     { key: "viewSize", target: "engine", opts: { min: 0.1, max: 6, step: 0.05, label: "zoom (view)" } },
-    { key: "speed", value: 1.0, opts: { min: 0, max: 3, step: 0.05 } },
+    { key: "speed", value: 0.35, opts: { min: 0, max: 3, step: 0.05 } },
     { key: "restitution", value: 1.0, opts: { min: 0, max: 1, step: 0.02 } },
     { key: "tempGain", value: 0.012, opts: { min: 0, max: 0.3, step: 0.005 } },
     { key: "tempDecay", value: 0.92, opts: { min: 0.8, max: 1, step: 0.005 } },
@@ -66,7 +67,6 @@ async function boot() {
 
   const hasHeap = !!(performance as any).memory;
 
-  // ---- controls pane (top-right), hidden until "/" ----------------------
   const ctrlWrap = document.createElement("div");
   ctrlWrap.style.cssText = "position:fixed;top:10px;right:10px;z-index:20;display:none;width:300px;";
   document.body.appendChild(ctrlWrap);
@@ -75,17 +75,30 @@ async function boot() {
   const folders: Record<string, any> = {};
   let modeBinding: any;
   for (const c of CONTROLS) {
-    const obj = c.target === "engine" ? engine : params;
     const parent = c.folder
       ? (folders[c.folder] ??= pane.addFolder({ title: c.folder, expanded: false }))
       : pane;
+    // numParticles drives per-frame dispatch/draw counts and buffer sizes.
+    // Bind to a holder and only commit (+rebuild) on slider release, so
+    // dragging never runs the sim against mismatched buffers (avoids the
+    // hitch and out-of-bounds access while scrubbing).
+    if (c.key === "numParticles") {
+      const holder = { numParticles: params.numParticles };
+      const b = parent.addBinding(holder, "numParticles", c.opts ?? {});
+      b.on("change", (ev: { last: boolean }) => {
+        if (!ev.last) return;
+        params.numParticles = holder.numParticles;
+        engine.rebuild();
+      });
+      continue;
+    }
+    const obj = c.target === "engine" ? engine : params;
     const b = parent.addBinding(obj, c.key, c.opts ?? {});
     if (c.rebuild === "last") b.on("change", (ev: { last: boolean }) => { if (ev.last) engine.rebuild(); });
     else if (c.rebuild === "always") b.on("change", () => engine.rebuild());
     if (c.key === "mode") modeBinding = b;
   }
 
-  // ---- metrics pane (top-left) ------------------------------------------
   const m = {
     fps: 0, frameMs: 0, computeMs: 0,
     jsHeapMB: 0, gpuMemMB: 0,
@@ -96,8 +109,6 @@ async function boot() {
   document.body.appendChild(metWrap);
   const met = new Pane({ container: metWrap, title: "metrics" });
 
-  // each metric: a numeric readout (graph view only shows the value on hover)
-  // followed by the graph itself with a blank label so they read as one row.
   met.addBinding(m, "fps", { readonly: true, format: (v: number) => v.toFixed(0) });
   met.addBinding(m, "fps", { readonly: true, view: "graph", min: 0, max: 165, label: " " });
   met.addBinding(m, "frameMs", { readonly: true, format: (v: number) => v.toFixed(1) + " ms", label: "frame ms (cpu)" });
@@ -117,7 +128,6 @@ async function boot() {
   fGrid.addBinding(m, "maxPerCell", { readonly: true, format: (v: number) => v.toFixed(0), label: "max / cell" });
   fGrid.addBinding(m, "overflow", { readonly: true, format: (v: number) => v.toFixed(0), label: "overflow (B drops)" });
 
-  // ---- keys: "/" debug, "M" toggle mode ---------------------------------
   let debug = false;
   window.addEventListener("keydown", (e) => {
     if (e.key === "/") {
@@ -125,15 +135,13 @@ async function boot() {
       debug = !debug;
       ctrlWrap.style.display = debug ? "block" : "none";
       metWrap.style.display = debug ? "block" : "none";
-      engine.collectStats = debug; // only run stat passes while panel is open
+      engine.collectStats = debug;
     } else if (e.key === "m" || e.key === "M") {
       params.mode = params.mode === "A" ? "B" : "A";
       modeBinding.refresh();
     }
   });
 
-  // ---- camera: drag to pan, wheel / pinch to zoom -----------------------
-  // screen pixel -> world coords using the current camera (optionally a custom zoom)
   function screenToWorld(px: number, py: number, vs = engine.viewSize): [number, number] {
     const aspect = canvas.width / canvas.height;
     const ndcX = (px / window.innerWidth) * 2 - 1;
@@ -154,7 +162,7 @@ async function boot() {
     if (!dragging) return;
     const [wx0, wy0] = screenToWorld(lastPx, lastPy);
     const [wx1, wy1] = screenToWorld(e.clientX, e.clientY);
-    engine.viewCenterX -= wx1 - wx0; // content follows the cursor
+    engine.viewCenterX -= wx1 - wx0;
     engine.viewCenterY -= wy1 - wy0;
     lastPx = e.clientX; lastPy = e.clientY;
   });
@@ -164,10 +172,8 @@ async function boot() {
 
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
-    // trackpad pinch arrives as ctrlKey+wheel; normal wheel also zooms
     const factor = Math.exp(e.deltaY * (e.ctrlKey ? 0.01 : 0.0015));
     const newVs = Math.min(Math.max(engine.viewSize * factor, 0.05), engine.worldSize * 2);
-    // keep the world point under the cursor fixed
     const [wx, wy] = screenToWorld(e.clientX, e.clientY, engine.viewSize);
     const [wx2, wy2] = screenToWorld(e.clientX, e.clientY, newVs);
     engine.viewCenterX += wx - wx2;
@@ -175,7 +181,6 @@ async function boot() {
     engine.viewSize = newVs;
   }, { passive: false });
 
-  // ---- main loop --------------------------------------------------------
   let last = performance.now();
   let acc = 0, frames = 0, frameMsSmooth = 0;
   function loop(now: number) {

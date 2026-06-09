@@ -8,6 +8,7 @@ import {
   COLLIDE_A_WGSL,
   CLEAR_B_WGSL,
   BIN_B_WGSL,
+  FIX_B_WGSL,
   COLLIDE_B_WGSL,
   RENDER_WGSL,
   CLEAR_STAT_WGSL,
@@ -20,20 +21,20 @@ export type Mode = "A" | "B";
 export interface SimParams {
   mode: Mode;
   numParticles: number;
-  speed: number; // dt multiplier
+  speed: number;
   restitution: number;
   tempGain: number;
   tempDecay: number;
   minSize: number;
   maxSize: number;
-  coverage: number; // target fraction of the box covered by particles (density)
-  cellScale: number; // grid cell size multiplier (1 = fits largest particle)
+  coverage: number;
+  cellScale: number;
   paused: boolean;
-  showGrid: boolean; // grid occupancy overlay
+  showGrid: boolean;
 }
 
-const PARTICLE_FLOATS = 6; // pos.xy, speed.xy, size, temp
-const PARTICLE_BYTES = PARTICLE_FLOATS * 4; // 24
+const PARTICLE_FLOATS = 6;
+const PARTICLE_BYTES = PARTICLE_FLOATS * 4;
 
 export class Engine {
   device: GPUDevice;
@@ -43,36 +44,30 @@ export class Engine {
   params: SimParams;
   aspect = 1;
 
-  // grid sizing
   gridW = 1;
   gridH = 1;
   numCells = 1;
   cellSize = 0.02;
-  worldSize = 1; // side length of the square sim box (grows with particle count)
-  viewSize = 0.75; // on-screen window into the world; keeps particles big like the reference
-  viewCenterX = 0.5; // camera pan (world coords); reset to world centre on rebuild
+  worldSize = 1;
+  viewSize = 0.75;
+  viewCenterX = 0.5;
   viewCenterY = 0.5;
 
-  // buffers
   private constBuf!: GPUBuffer;
   private particleBuf!: GPUBuffer;
   private newSpeedBuf!: GPUBuffer;
   private newTempBuf!: GPUBuffer;
-  // mode A
   private gridHeadBuf!: GPUBuffer;
   private gridNextBuf!: GPUBuffer;
-  // mode B
   private cellCountBuf!: GPUBuffer;
   private cellPartBuf!: GPUBuffer;
   private occupiedBuf!: GPUBuffer;
   private dispatchBuf!: GPUBuffer;
-  // occupancy stats (overlay + metrics)
   private statCountBuf!: GPUBuffer;
   private statMetaBuf!: GPUBuffer;
   private statResultBuf!: GPUBuffer;
   private statPending = false;
 
-  // pipelines
   private pIntegrate!: GPUComputePipeline;
   private pApply!: GPUComputePipeline;
   private pClearA!: GPUComputePipeline;
@@ -80,13 +75,13 @@ export class Engine {
   private pCollideA!: GPUComputePipeline;
   private pClearB!: GPUComputePipeline;
   private pBinB!: GPUComputePipeline;
+  private pFixB!: GPUComputePipeline;
   private pCollideB!: GPUComputePipeline;
   private pClearStat!: GPUComputePipeline;
   private pBinStat!: GPUComputePipeline;
   private pRender!: GPURenderPipeline;
   private pOverlay!: GPURenderPipeline;
 
-  // layouts
   private bglSim!: GPUBindGroupLayout;
   private bglA!: GPUBindGroupLayout;
   private bglB!: GPUBindGroupLayout;
@@ -95,7 +90,6 @@ export class Engine {
   private bglStat!: GPUBindGroupLayout;
   private bglOverlay!: GPUBindGroupLayout;
 
-  // bind groups
   private bgSim!: GPUBindGroup;
   private bgA!: GPUBindGroup;
   private bgB!: GPUBindGroup;
@@ -108,7 +102,6 @@ export class Engine {
   private constU32 = new Uint32Array(this.constArray);
   private constF32 = new Float32Array(this.constArray);
 
-  // GPU timing (compute ms/frame) via timestamp-query
   canTimestamp = false;
   gpuMs = 0;
   private querySet?: GPUQuerySet;
@@ -116,8 +109,7 @@ export class Engine {
   private tsResult?: GPUBuffer;
   private tsPending = false;
 
-  // metrics surfaced to the UI
-  collectStats = false; // only run stat passes when the debug panel is open
+  collectStats = false;
   gpuBytes = 0;
   occupied = 0;
   maxCell = 0;
@@ -169,7 +161,7 @@ export class Engine {
     this.bglBCollide = d.createBindGroupLayout({
       entries: [
         buf(0, "uniform"), buf(1, "storage"), buf(2, "storage"), buf(3, "storage"),
-        buf(4, "storage"), buf(5, "storage"), buf(6, "storage"),
+        buf(4, "storage"), buf(5, "storage"), buf(6, "storage"), buf(7, "read-only-storage"),
       ],
     });
     this.bglRender = d.createBindGroupLayout({
@@ -208,6 +200,7 @@ export class Engine {
     this.pCollideA = this.compute(COLLIDE_A_WGSL, this.bglA);
     this.pClearB = this.compute(CLEAR_B_WGSL, this.bglB);
     this.pBinB = this.compute(BIN_B_WGSL, this.bglB);
+    this.pFixB = this.compute(FIX_B_WGSL, this.bglB);
     this.pCollideB = this.compute(COLLIDE_B_WGSL, this.bglBCollide);
     this.pClearStat = this.compute(CLEAR_STAT_WGSL, this.bglStat);
     this.pBinStat = this.compute(BIN_STAT_WGSL, this.bglStat);
@@ -253,13 +246,10 @@ export class Engine {
     });
   }
 
-  /** (re)allocate buffers + bind groups for current particle count / sizes. */
   rebuild() {
     const d = this.device;
     const N = this.params.numParticles;
 
-    // pick particle sizes first, then size the world so total coverage (density)
-    // stays constant as the count changes — sparse like the reference.
     const sizes = new Float32Array(N);
     let area = 0;
     for (let i = 0; i < N; i++) {
@@ -269,18 +259,15 @@ export class Engine {
     }
     this.worldSize = Math.max(Math.sqrt(area / Math.max(this.params.coverage, 0.01)), 4 * this.params.maxSize);
     const L = this.worldSize;
-    // recentre the camera on the (resized) world
     this.viewCenterX = L * 0.5;
     this.viewCenterY = L * 0.5;
     this.viewSize = Math.min(this.viewSize, L);
 
-    // grid: cell must fit the largest particle (diameter = 2*maxSize)
     this.cellSize = Math.max(2 * this.params.maxSize * this.params.cellScale, 1e-3);
     this.gridW = Math.max(1, Math.floor(L / this.cellSize));
     this.gridH = this.gridW;
     this.numCells = this.gridW * this.gridH;
 
-    // free previous
     for (const b of [
       this.constBuf, this.particleBuf, this.newSpeedBuf, this.newTempBuf,
       this.gridHeadBuf, this.gridNextBuf, this.cellCountBuf, this.cellPartBuf,
@@ -293,12 +280,12 @@ export class Engine {
     for (let i = 0; i < N; i++) {
       const o = i * PARTICLE_FLOATS;
       const size = sizes[i];
-      init[o + 0] = size + Math.random() * (L - 2 * size); // pos.x inside walls
-      init[o + 1] = size + Math.random() * (L - 2 * size); // pos.y
+      init[o + 0] = size + Math.random() * (L - 2 * size);
+      init[o + 1] = size + Math.random() * (L - 2 * size);
       const ang = Math.random() * Math.PI * 2;
-      const spd = (0.05 + Math.random() * 0.15) * L; // scale with box so motion looks the same
-      init[o + 2] = Math.cos(ang) * spd; // speed.x
-      init[o + 3] = Math.sin(ang) * spd; // speed.y
+      const spd = (0.05 + Math.random() * 0.15) * L;
+      init[o + 2] = Math.cos(ang) * spd;
+      init[o + 3] = Math.sin(ang) * spd;
       init[o + 4] = size;
       init[o + 5] = 0;
     }
@@ -311,34 +298,29 @@ export class Engine {
     this.newSpeedBuf = d.createBuffer({ size: N * 8, usage: GPUBufferUsage.STORAGE });
     this.newTempBuf = d.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE });
 
-    // mode A
     this.gridHeadBuf = d.createBuffer({ size: this.numCells * 4, usage: GPUBufferUsage.STORAGE });
     this.gridNextBuf = d.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE });
 
-    // mode B
     this.cellCountBuf = d.createBuffer({ size: this.numCells * 4, usage: GPUBufferUsage.STORAGE });
     this.cellPartBuf = d.createBuffer({ size: this.numCells * MAX_PER_CELL * 4, usage: GPUBufferUsage.STORAGE });
     this.occupiedBuf = d.createBuffer({ size: this.numCells * 4, usage: GPUBufferUsage.STORAGE });
     this.dispatchBuf = d.createBuffer({
-      size: 12,
+      size: 16,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST,
     });
 
-    // occupancy stats
     this.statCountBuf = d.createBuffer({ size: this.numCells * 4, usage: GPUBufferUsage.STORAGE });
     this.statMetaBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     if (!this.statResultBuf) {
       this.statResultBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     }
 
-    // rough GPU memory footprint of the sim buffers
     this.gpuBytes =
-      N * PARTICLE_BYTES + N * 12 + // particles + newSpeed + newTemp
-      this.numCells * 4 + N * 4 +  // grid A
-      this.numCells * (4 + MAX_PER_CELL * 4 + 4) + 12 + // grid B
-      this.numCells * 4 + 16;       // stats
+      N * PARTICLE_BYTES + N * 12 +
+      this.numCells * 4 + N * 4 +
+      this.numCells * (4 + MAX_PER_CELL * 4 + 4) + 12 +
+      this.numCells * 4 + 16;
 
-    // bind groups
     const e = (binding: number, buffer: GPUBuffer) => ({ binding, resource: { buffer } });
     this.bgSim = d.createBindGroup({
       layout: this.bglSim,
@@ -362,7 +344,7 @@ export class Engine {
       layout: this.bglBCollide,
       entries: [
         e(0, this.constBuf), e(1, this.particleBuf), e(2, this.newSpeedBuf), e(3, this.newTempBuf),
-        e(4, this.cellCountBuf), e(5, this.cellPartBuf), e(6, this.occupiedBuf),
+        e(4, this.cellCountBuf), e(5, this.cellPartBuf), e(6, this.occupiedBuf), e(7, this.dispatchBuf),
       ],
     });
     this.bgRender = d.createBindGroup({
@@ -380,6 +362,16 @@ export class Engine {
   }
 
   setAspect(a: number) { this.aspect = a; }
+
+  // Split a 1D workgroup count into an (x, y) grid so neither dimension
+  // exceeds maxComputeWorkgroupsPerDimension (65535). Shaders re-flatten
+  // via linearId(). Over-dispatch is harmless: extra threads early-out.
+  private static readonly MAX_DIM = 65535;
+  private split(groups: number): [number, number] {
+    const g = Math.max(groups, 1);
+    if (g <= Engine.MAX_DIM) return [g, 1];
+    return [Engine.MAX_DIM, Math.ceil(g / Engine.MAX_DIM)];
+  }
 
   async debugRead(n = 8): Promise<number[][]> {
     const d = this.device;
@@ -430,8 +422,8 @@ export class Engine {
     f[11] = this.viewSize;
     f[12] = this.viewCenterX;
     f[13] = this.viewCenterY;
-    u[14] = p.mode === "B" ? 1 : 0;        // overlay: which algorithm is live
-    f[15] = this.maxCell;                  // overlay: A scales heat by observed max/cell
+    u[14] = p.mode === "B" ? 1 : 0;
+    f[15] = this.maxCell;
     this.device.queue.writeBuffer(this.constBuf, 0, this.constArray);
   }
 
@@ -445,43 +437,42 @@ export class Engine {
     const ts = this.canTimestamp && !this.tsPending;
 
     if (!p.paused) {
-      const cellGroups = Math.ceil(this.numCells / WG);
-      const partGroups = Math.ceil(p.numParticles / WG);
+      const cellGroups = this.split(Math.ceil(this.numCells / WG));
+      const partGroups = this.split(Math.ceil(p.numParticles / WG));
 
       if (p.mode === "A") {
         const cp = enc.beginComputePass(
           ts ? { timestampWrites: { querySet: this.querySet!, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
         );
         cp.setBindGroup(0, this.bgA);
-        cp.setPipeline(this.pClearA); cp.dispatchWorkgroups(cellGroups);
+        cp.setPipeline(this.pClearA); cp.dispatchWorkgroups(...cellGroups);
         cp.setBindGroup(0, this.bgSim);
-        cp.setPipeline(this.pIntegrate); cp.dispatchWorkgroups(partGroups);
+        cp.setPipeline(this.pIntegrate); cp.dispatchWorkgroups(...partGroups);
         cp.setBindGroup(0, this.bgA);
-        cp.setPipeline(this.pBinA); cp.dispatchWorkgroups(partGroups);
-        cp.setPipeline(this.pCollideA); cp.dispatchWorkgroups(partGroups);
+        cp.setPipeline(this.pBinA); cp.dispatchWorkgroups(...partGroups);
+        cp.setPipeline(this.pCollideA); cp.dispatchWorkgroups(...partGroups);
         cp.setBindGroup(0, this.bgSim);
-        cp.setPipeline(this.pApply); cp.dispatchWorkgroups(partGroups);
+        cp.setPipeline(this.pApply); cp.dispatchWorkgroups(...partGroups);
         cp.end();
       } else {
-        // pass 1: clear + integrate + bin (writes dispatchArgs as storage)
         const cp = enc.beginComputePass(
           ts ? { timestampWrites: { querySet: this.querySet!, beginningOfPassWriteIndex: 0 } } : undefined,
         );
         cp.setBindGroup(0, this.bgB);
-        cp.setPipeline(this.pClearB); cp.dispatchWorkgroups(Math.max(cellGroups, 1));
+        cp.setPipeline(this.pClearB); cp.dispatchWorkgroups(...cellGroups);
         cp.setBindGroup(0, this.bgSim);
-        cp.setPipeline(this.pIntegrate); cp.dispatchWorkgroups(partGroups);
+        cp.setPipeline(this.pIntegrate); cp.dispatchWorkgroups(...partGroups);
         cp.setBindGroup(0, this.bgB);
-        cp.setPipeline(this.pBinB); cp.dispatchWorkgroups(partGroups);
+        cp.setPipeline(this.pBinB); cp.dispatchWorkgroups(...partGroups);
+        cp.setPipeline(this.pFixB); cp.dispatchWorkgroups(1);
         cp.end();
-        // pass 2: collide (dispatchArgs used only as indirect) + apply
         const cp2 = enc.beginComputePass(
           ts ? { timestampWrites: { querySet: this.querySet!, endOfPassWriteIndex: 1 } } : undefined,
         );
         cp2.setBindGroup(0, this.bgBCollide);
         cp2.setPipeline(this.pCollideB); cp2.dispatchWorkgroupsIndirect(this.dispatchBuf, 0);
         cp2.setBindGroup(0, this.bgSim);
-        cp2.setPipeline(this.pApply); cp2.dispatchWorkgroups(partGroups);
+        cp2.setPipeline(this.pApply); cp2.dispatchWorkgroups(...partGroups);
         cp2.end();
       }
 
@@ -491,13 +482,12 @@ export class Engine {
       }
     }
 
-    // occupancy stats for overlay + metrics (not part of the timed region)
     const doStats = this.collectStats;
     if (doStats) {
       const sp = enc.beginComputePass();
       sp.setBindGroup(0, this.bgStat);
-      sp.setPipeline(this.pClearStat); sp.dispatchWorkgroups(Math.max(Math.ceil(this.numCells / WG), 1));
-      sp.setPipeline(this.pBinStat); sp.dispatchWorkgroups(Math.ceil(p.numParticles / WG));
+      sp.setPipeline(this.pClearStat); sp.dispatchWorkgroups(...this.split(Math.ceil(this.numCells / WG)));
+      sp.setPipeline(this.pBinStat); sp.dispatchWorkgroups(...this.split(Math.ceil(p.numParticles / WG)));
       sp.end();
       if (!this.statPending) {
         enc.copyBufferToBuffer(this.statMetaBuf, 0, this.statResultBuf!, 0, 16);
@@ -541,7 +531,7 @@ export class Engine {
       rb.mapAsync(GPUMapMode.READ).then(() => {
         const t = new BigInt64Array(rb.getMappedRange().slice(0));
         const ns = Number(t[1] - t[0]);
-        if (ns > 0) this.gpuMs = this.gpuMs * 0.85 + (ns / 1e6) * 0.15; // smooth
+        if (ns > 0) this.gpuMs = this.gpuMs * 0.85 + (ns / 1e6) * 0.15;
         rb.unmap();
         this.tsPending = false;
       });
