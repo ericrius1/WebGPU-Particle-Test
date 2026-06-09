@@ -1,18 +1,26 @@
 # WebGPU Particles — Spatial-Hash Collisions
 
 A pure **WebGPU + TypeScript** port of Diligent Engine's
-[Tutorial14 ComputeShader](https://github.com/DiligentGraphics/DiligentSamples/tree/master/Tutorials/Tutorial14_ComputeShader):
-thousands of different-sized circles bouncing in a box, colliding through a
-spatial-hash grid — entirely on the GPU. No physics library, no CPU step; every
-particle integrates, bins, collides, and shades in compute/render passes.
-Colour encodes kinetic energy plus a collision-heat flash.
+[Tutorial14 ComputeShader](https://github.com/DiligentGraphics/DiligentSamples/tree/master/Tutorials/Tutorial14_ComputeShader),
+scaled to **1,000,000** different-sized circles bouncing in a box, colliding
+through a spatial-hash grid — entirely on the GPU. No physics library, no CPU
+step; every particle integrates, bins, collides, and shades in compute/render
+passes. Colour encodes kinetic energy plus a collision-heat flash.
+
+Default is **1M particles, Mode B**. Drag to pan, scroll to zoom.
 
 ```bash
 npm install
 npm run dev      # http://localhost:5190 (or whatever Vite picks)
 ```
 
-Needs a WebGPU browser (Chrome/Edge 113+). Press **`/`** for the debug UI.
+Needs a WebGPU browser (Chrome/Edge 113+). The debug UI is **open by default**;
+press **`/`** to toggle it, **`m`** to flip collision mode A/B.
+
+At 1M particles the grid buffers blow past the default 256 MB binding cap, so
+boot requests the adapter's max `maxBufferSize` / `maxStorageBufferBindingSize`.
+Dispatches that exceed the 65535-per-dimension workgroup limit are split into a
+2D grid and re-flattened in-shader (`linearId`).
 
 ---
 
@@ -46,40 +54,50 @@ from global memory.
 
 ### Mode B — per occupied bucket (shared memory)
 
-Iterates by **bucket** instead of by particle.
+Iterates by **bucket** instead of by particle. Per frame: `clearB`,
+`integrate`, `binB`, `fixB`, `collideB`, `apply`.
 
-- `bin` uses counting buckets: `atomicAdd` on a per-cell counter stores up to
+- `binB` uses counting buckets: `atomicAdd` on a per-cell counter stores up to
   `MAX_PER_CELL` (16) particle indices per cell. The **first** particle to land
   in a cell (`slot == 0`) appends that cell to an `occupied` list via an atomic
   counter — and that counter doubles as the `x` of an **indirect-dispatch**
   buffer.
-- `collide` dispatches **one workgroup per occupied bucket**
-  (`dispatchWorkgroupsIndirect`). Its 16 threads cooperatively stage the entire
-  3×3 neighbourhood — `16 × 9 = 144` particles — into **workgroup shared
-  memory**, `workgroupBarrier()`, then each thread collides its own particle
-  against the shared set. Neighbours are read from global memory **once per
-  workgroup** instead of once per particle.
+- `fixB` (one thread) turns that occupied count into the indirect dispatch args:
+  it stashes the count for `collideB` to bound-check, then divides by
+  `BUCKETS_PER_WG` and splits the workgroup count across x/y to respect the
+  65535-per-dimension limit.
+- `collideB` dispatches indirectly, **one workgroup per `BUCKETS_PER_WG` (4)
+  occupied cells**. The 64 lanes pack as `4 buckets × 16 slots`, so waves run
+  full instead of 1/4 idle. Each bucket stages its 3×3 neighbourhood into
+  **workgroup shared memory** *compactly* — an atomic append that packs only the
+  real particles, no `INVALID` holes — then `workgroupBarrier()`, and every
+  survivor loops just the actual neighbour count rather than a fixed
+  `9 × 16 = 144`. Neighbours are read from global memory **once per workgroup**
+  instead of once per particle.
 
 Empty cells cost nothing (never dispatched). Cells over capacity drop the
 overflow — the 16-per-cell budget the design assumes.
 
-> The indirect-args buffer is written as storage in `bin` and read as `INDIRECT`
-> in `collide`. Those uses live in **separate compute passes**, otherwise WebGPU
-> rejects the buffer for mixing writable-storage and indirect usage in one sync
-> scope.
+> The indirect-args buffer is written as storage in `binB`/`fixB` and read as
+> `INDIRECT` in `collideB`. Those uses live in **separate compute passes**,
+> otherwise WebGPU rejects the buffer for mixing writable-storage and indirect
+> usage in one sync scope.
 
 ### A vs B — the tradeoff
 
-Mode B is **not** unconditionally faster. `compute ms` (timestamp-query
-wall-clock GPU time) shows where each wins:
+Mode B is **not** unconditionally faster. Where each wins:
 
-- **Dense** cells (near `MAX_PER_CELL`): **B wins** — the 144-entry shared load
-  amortises over many particles; neighbours read once per workgroup.
-- **Sparse** cells (≪1 particle/cell, the reference-density default): **B
-  loses** — every occupied bucket still pays the full shared-memory load for
-  mostly-empty neighbourhoods, while A just walks a couple of short lists.
+- **Dense** cells (near `MAX_PER_CELL`): **B wins** — the shared stage amortises
+  over many particles; neighbours read once per workgroup, packed 4 buckets to a
+  full 64-lane wave.
+- **Sparse** cells (≪1 particle/cell): **B loses** — every occupied bucket still
+  pays the shared-memory staging for mostly-empty neighbourhoods, while A just
+  walks a couple of short lists.
 
-Change density/count and the two curves cross.
+The defaults (density `0.3`, grid cell `×3`) sit at B's sweet spot — ~7
+particles per occupied cell, where shared-mem reuse beats A and overflow stays
+<0.1%. Drop the density or count and the two curves cross. `compute ms`
+(timestamp-query GPU wall-clock) shows the crossover live.
 
 ---
 
@@ -114,8 +132,9 @@ sparse). The grid scales with `L`, keeping bucket occupancy bounded.
 
 A fixed-size **view window** (`viewSize` = zoom, `viewCenter` = pan) is rendered
 into that world, so particles stay big on screen — you watch a window into a
-larger sim. Rendering is letterboxed to a square so circles stay round on any
-aspect.
+larger sim. **Drag** to pan, **scroll** to zoom (Ctrl-scroll zooms faster), both
+anchored under the cursor. Rendering is letterboxed to a square so circles stay
+round on any aspect.
 
 ---
 
@@ -141,10 +160,11 @@ tiny, mode-independent count pass that runs **only** while the panel is open
 
 ## Layout
 
-- `src/shaders/` — all WGSL, one file per pass. `common.wgsl` holds the shared
-  structs, grid helpers, and `collidePair`; per-pass binding blocks + bodies are
-  glued onto it in `index.ts`. Compile-time constants (`WG = 64`,
-  `MAX_PER_CELL = 16`) live in `common.wgsl` and are mirrored in `index.ts` for
+- `src/shaders/` — all WGSL, one file per pass (`bin*`, `collide*`, `fixB`, …).
+  `common.wgsl` holds the shared structs, grid helpers, `linearId`, and
+  `collidePair`; per-pass binding blocks + bodies are glued onto it in
+  `index.ts`. Compile-time constants (`WG = 64`, `MAX_PER_CELL = 16`,
+  `BUCKETS_PER_WG = 4`) live in `common.wgsl` and are mirrored in `index.ts` for
   host-side dispatch/buffer math — they **must** stay in sync.
 - `src/engine.ts` — buffers, bind groups, pipelines, per-frame pass scheduling.
 - `src/main.ts` — device init, canvas, Tweakpane debug, main loop.

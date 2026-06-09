@@ -34,19 +34,19 @@ async function boot() {
   };
   const CONTROLS: Control[] = [
     { key: "mode", value: "B", opts: { options: { "A — per particle (linked list)": "A", "B — per bucket (shared mem)": "B" } } },
-    { key: "numParticles", value: 1000000, rebuild: "last", opts: { min: 100, max: 1000000, step: 100 } },
+    { key: "numParticles", value: 1000000, rebuild: "last", opts: { min: 100, max: 2000000, step: 100 } },
     // density (coverage) + grid cell × default to B's sweet spot: ~7 particles
     // per occupied cell, where shared-mem reuse beats A and overflow is <0.1%.
     { key: "coverage", value: 0.3, rebuild: "last", opts: { min: 0.02, max: 0.3, step: 0.01, label: "density" } },
     { key: "cellScale", value: 3.0, rebuild: "always", opts: { min: 1, max: 8, step: 0.5, label: "grid cell ×" } },
     { key: "viewSize", target: "engine", opts: { min: 0.1, max: 6, step: 0.05, label: "zoom (view)" } },
-    { key: "speed", value: 0.35, opts: { min: 0, max: 3, step: 0.05 } },
+    { key: "speed", value: 0.12, opts: { min: 0, max: 0.5, step: 0.01 } },
     { key: "restitution", value: 1.0, opts: { min: 0, max: 1, step: 0.02 } },
     { key: "tempGain", value: 0.012, opts: { min: 0, max: 0.3, step: 0.005 } },
     { key: "tempDecay", value: 0.92, opts: { min: 0.8, max: 1, step: 0.005 } },
     { key: "minSize", value: 0.004, folder: "particle size", rebuild: "last", opts: { min: 0.002, max: 0.02, step: 0.001 } },
     { key: "maxSize", value: 0.011, folder: "particle size", rebuild: "last", opts: { min: 0.004, max: 0.03, step: 0.001 } },
-    { key: "showGrid", value: false, opts: { label: "grid overlay" } },
+    { key: "showGrid", value: true, opts: { label: "grid overlay" } },
     { key: "paused", value: false },
   ];
 
@@ -130,14 +130,20 @@ async function boot() {
   fGrid.addBinding(m, "maxPerCell", { readonly: true, format: (v: number) => v.toFixed(0), label: "max / cell" });
   fGrid.addBinding(m, "overflow", { readonly: true, format: (v: number) => v.toFixed(0), label: "overflow (B drops)" });
 
-  let debug = false;
+  const hint = document.getElementById("hint");
+  let debug = true;
+  const applyDebug = () => {
+    ctrlWrap.style.display = debug ? "block" : "none";
+    metWrap.style.display = debug ? "block" : "none";
+    if (hint) hint.style.display = debug ? "none" : "block";
+    engine.collectStats = debug;
+  };
+  applyDebug();
   window.addEventListener("keydown", (e) => {
     if (e.key === "/") {
       e.preventDefault();
       debug = !debug;
-      ctrlWrap.style.display = debug ? "block" : "none";
-      metWrap.style.display = debug ? "block" : "none";
-      engine.collectStats = debug;
+      applyDebug();
     } else if (e.key === "m" || e.key === "M") {
       params.mode = params.mode === "A" ? "B" : "A";
       modeBinding.refresh();
