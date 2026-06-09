@@ -32,10 +32,10 @@ export interface SimParams {
   minSize: number;
   maxSize: number;
   coverage: number;
-  // Auto-switch tuning (see updateAutoMode). gpuParallel ~ workgroups B needs
-  // to launch before it saturates this GPU; below it, A's full-width per-particle
-  // dispatch is faster.
-  gpuParallel: number;
+  // Auto-switch tuning (see updateAutoMode). Minimum workgroups mode B must
+  // launch (ceil(occupied/4)) before it's worth running; below this the GPU
+  // would be under-fed and A's full-width per-particle dispatch is faster.
+  bModeMinWorkgroups: number;
   paused: boolean;
   showGrid: boolean;
 }
@@ -452,7 +452,7 @@ export class Engine {
     const occ = this.occupied;
     if (occ <= 0) return; // no stats yet — keep current pick
     const bWG = Math.ceil(occ / BUCKETS_PER_WG);   // workgroups B would launch
-    const sat = Math.max(this.params.gpuParallel, 1);
+    const sat = Math.max(this.params.bModeMinWorkgroups, 1);
 
     const want: Mode = this.activeMode === "B"
       ? (bWG < sat ? "A" : "B")          // leave B as soon as it starves

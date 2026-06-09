@@ -39,9 +39,10 @@ async function boot() {
     // (box shrinks as this rises -> tighter packing). Applied on slider release.
     { key: "coverage", value: 0.3, rebuild: "last", opts: { min: 0.02, max: 0.7, step: 0.01, label: "world density" } },
     // Grid cell is fixed at the largest particle's diameter (see engine).
-    // Auto-switch knob: gpuParallel ~ workgroups B needs (ceil(occupied/4)) to
-    // saturate this GPU; below it the sim falls back to mode A.
-    { key: "gpuParallel", value: 2048, folder: "auto switch", opts: { min: 64, max: 8192, step: 64, label: "gpu parallel (wg)" } },
+    // Auto-switch knob: min workgroups B must launch (ceil(occupied/4)) before
+    // it beats A. Default tuned for an Apple M3 Max (40-core GPU): ~40 cores x
+    // ~4 resident 64-thread groups x ~6 oversubscription for latency hiding.
+    { key: "bModeMinWorkgroups", value: 4096, folder: "auto switch", opts: { min: 64, max: 16384, step: 64, label: "min workgroups for B" } },
     { key: "viewSize", target: "engine", opts: { min: 0.1, max: 6, step: 0.05, label: "zoom (view)" } },
     { key: "speed", value: 0.02, opts: { min: 0, max: 0.1, step: 0.01 } },
     { key: "restitution", value: 1.0, opts: { min: 0, max: 1, step: 0.02 } },
