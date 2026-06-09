@@ -1,6 +1,7 @@
 import {
   WG,
   MAX_PER_CELL,
+  BUCKETS_PER_WG,
   INTEGRATE_WGSL,
   APPLY_WGSL,
   CLEAR_A_WGSL,
@@ -16,10 +17,13 @@ import {
   OVERLAY_WGSL,
 } from "./shaders";
 
+// The two collision strategies the sim can actually run.
 export type Mode = "A" | "B";
+// What the UI offers: either pin a strategy, or let the engine pick per frame.
+export type ModeSel = "A" | "B" | "auto";
 
 export interface SimParams {
-  mode: Mode;
+  mode: ModeSel;
   numParticles: number;
   speed: number;
   restitution: number;
@@ -28,7 +32,10 @@ export interface SimParams {
   minSize: number;
   maxSize: number;
   coverage: number;
-  cellScale: number;
+  // Auto-switch tuning (see updateAutoMode). gpuParallel ~ workgroups B needs
+  // to launch before it saturates this GPU; below it, A's full-width per-particle
+  // dispatch is faster.
+  gpuParallel: number;
   paused: boolean;
   showGrid: boolean;
 }
@@ -43,6 +50,12 @@ export class Engine {
 
   params: SimParams;
   aspect = 1;
+
+  // Strategy actually executed this frame. Equals params.mode unless that is
+  // "auto", in which case updateAutoMode() drives it. Read by metrics + the
+  // overlay (via the `mode` constant) so they reflect what really ran.
+  activeMode: Mode = "B";
+  private autoDwell = 0;
 
   gridW = 1;
   gridH = 1;
@@ -263,7 +276,10 @@ export class Engine {
     this.viewCenterY = L * 0.5;
     this.viewSize = Math.min(this.viewSize, L);
 
-    this.cellSize = Math.max(2 * this.params.maxSize * this.params.cellScale, 1e-3);
+    // Cell = largest particle's diameter: the smallest grid that still lets the
+    // 3x3 neighbour search catch every possible collision (max centre distance
+    // is ra+rb <= 2*maxSize). No reason to make buckets bigger.
+    this.cellSize = Math.max(2 * this.params.maxSize, 1e-3);
     this.gridW = Math.max(1, Math.floor(L / this.cellSize));
     this.gridH = this.gridW;
     this.numCells = this.gridW * this.gridH;
@@ -406,7 +422,7 @@ export class Engine {
     return { meta, countSum: sum, countNonZero: nz };
   }
 
-  private writeConstants(dt: number) {
+  private writeConstants(dt: number, mode: Mode) {
     const u = this.constU32, f = this.constF32, p = this.params;
     u[0] = p.numParticles;
     u[1] = this.gridW;
@@ -422,16 +438,42 @@ export class Engine {
     f[11] = this.viewSize;
     f[12] = this.viewCenterX;
     f[13] = this.viewCenterY;
-    u[14] = p.mode === "B" ? 1 : 0;
+    u[14] = mode === "B" ? 1 : 0;
     f[15] = this.maxCell;
     this.device.queue.writeBuffer(this.constBuf, 0, this.constArray);
+  }
+
+  // Pick A or B from how many workgroups B would launch (ceil(occupied / 4)).
+  // B's shared-mem path wins while it has enough occupied cells to saturate the
+  // GPU; once particles spread thin, drop to few cells, or clump into a handful
+  // (the "black hole" collapse), it starves and A's full-width per-particle
+  // dispatch is faster. Margin + dwell counter give hysteresis so it can't flap.
+  private updateAutoMode() {
+    const occ = this.occupied;
+    if (occ <= 0) return; // no stats yet — keep current pick
+    const bWG = Math.ceil(occ / BUCKETS_PER_WG);   // workgroups B would launch
+    const sat = Math.max(this.params.gpuParallel, 1);
+
+    const want: Mode = this.activeMode === "B"
+      ? (bWG < sat ? "A" : "B")          // leave B as soon as it starves
+      : (bWG >= sat * 1.5 ? "B" : "A");  // re-enter B only when comfortably busy
+
+    this.autoDwell++;
+    if (want !== this.activeMode && this.autoDwell >= 12) {
+      this.activeMode = want;
+      this.autoDwell = 0;
+    }
   }
 
   frame(dtSeconds: number) {
     const d = this.device;
     const p = this.params;
     const dt = p.paused ? 0 : Math.min(dtSeconds, 1 / 30) * p.speed;
-    this.writeConstants(dt);
+
+    if (p.mode === "auto") this.updateAutoMode();
+    else this.activeMode = p.mode;
+    const mode = this.activeMode;
+    this.writeConstants(dt, mode);
 
     const enc = d.createCommandEncoder();
     const ts = this.canTimestamp && !this.tsPending;
@@ -440,7 +482,7 @@ export class Engine {
       const cellGroups = this.split(Math.ceil(this.numCells / WG));
       const partGroups = this.split(Math.ceil(p.numParticles / WG));
 
-      if (p.mode === "A") {
+      if (mode === "A") {
         const cp = enc.beginComputePass(
           ts ? { timestampWrites: { querySet: this.querySet!, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
         );
@@ -482,7 +524,9 @@ export class Engine {
       }
     }
 
-    const doStats = this.collectStats;
+    // Auto needs live occupancy to decide, so compute stats even when the
+    // debug overlay is off; the overlay itself still gates on collectStats.
+    const doStats = this.collectStats || p.mode === "auto";
     if (doStats) {
       const sp = enc.beginComputePass();
       sp.setBindGroup(0, this.bgStat);
@@ -500,7 +544,7 @@ export class Engine {
         { view, clearValue: { r: 0.62, g: 0.62, b: 0.62, a: 1 }, loadOp: "clear", storeOp: "store" },
       ],
     });
-    if (p.showGrid && doStats) {
+    if (p.showGrid && this.collectStats) {
       rp.setPipeline(this.pOverlay);
       rp.setBindGroup(0, this.bgOverlay);
       rp.draw(6, this.numCells);

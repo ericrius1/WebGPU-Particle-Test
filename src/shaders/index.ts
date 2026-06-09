@@ -21,6 +21,10 @@ import overlay from "./overlay.wgsl?raw";
 
 export const MAX_PER_CELL = 16;
 export const WG = 64;
+// Occupied cells handled per workgroup in mode B (mirrors common.wgsl).
+// B launches ceil(occupied / BUCKETS_PER_WG) workgroups, so this sets how
+// few occupied cells it takes to starve the GPU — the auto-switch uses it.
+export const BUCKETS_PER_WG = 4;
 
 const link = (...parts: string[]) => parts.join("\n");
 

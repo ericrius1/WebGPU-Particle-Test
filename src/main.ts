@@ -33,14 +33,17 @@ async function boot() {
     opts?: Record<string, unknown>;
   };
   const CONTROLS: Control[] = [
-    { key: "mode", value: "B", opts: { options: { "A — per particle (linked list)": "A", "B — per bucket (shared mem)": "B" } } },
+    { key: "mode", value: "auto", opts: { options: { "Auto (switch A/B)": "auto", "A — per particle (linked list)": "A", "B — per bucket (shared mem)": "B" } } },
     { key: "numParticles", value: 1000000, rebuild: "last", opts: { min: 100, max: 2000000, step: 100 } },
-    // density (coverage) + grid cell × default to B's sweet spot: ~7 particles
-    // per occupied cell, where shared-mem reuse beats A and overflow is <0.1%.
-    { key: "coverage", value: 0.3, rebuild: "last", opts: { min: 0.02, max: 0.3, step: 0.01, label: "density" } },
-    { key: "cellScale", value: 3.0, rebuild: "always", opts: { min: 1, max: 8, step: 0.5, label: "grid cell ×" } },
+    // Target fraction of the sim box covered by particles. Sets worldSize
+    // (box shrinks as this rises -> tighter packing). Applied on slider release.
+    { key: "coverage", value: 0.3, rebuild: "last", opts: { min: 0.02, max: 0.7, step: 0.01, label: "world density" } },
+    // Grid cell is fixed at the largest particle's diameter (see engine).
+    // Auto-switch knob: gpuParallel ~ workgroups B needs (ceil(occupied/4)) to
+    // saturate this GPU; below it the sim falls back to mode A.
+    { key: "gpuParallel", value: 2048, folder: "auto switch", opts: { min: 64, max: 8192, step: 64, label: "gpu parallel (wg)" } },
     { key: "viewSize", target: "engine", opts: { min: 0.1, max: 6, step: 0.05, label: "zoom (view)" } },
-    { key: "speed", value: 0.05, opts: { min: 0, max: 0.5, step: 0.01 } },
+    { key: "speed", value: 0.02, opts: { min: 0, max: 0.1, step: 0.01 } },
     { key: "restitution", value: 1.0, opts: { min: 0, max: 1, step: 0.02 } },
     { key: "tempGain", value: 0.012, opts: { min: 0, max: 0.3, step: 0.005 } },
     { key: "tempDecay", value: 0.92, opts: { min: 0.8, max: 1, step: 0.005 } },
@@ -102,15 +105,18 @@ async function boot() {
   }
 
   const m = {
+    active: "B",
     fps: 0, frameMs: 0, computeMs: 0,
     jsHeapMB: 0, gpuMemMB: 0,
     cells: 0, occupied: 0, occupiedPct: 0, avgPerCell: 0, maxPerCell: 0, overflow: 0,
+    worldSize: 0, inView: 0,
   };
   const metWrap = document.createElement("div");
   metWrap.style.cssText = "position:fixed;top:10px;left:10px;z-index:20;display:none;width:280px;";
   document.body.appendChild(metWrap);
   const met = new Pane({ container: metWrap, title: "metrics" });
 
+  met.addBinding(m, "active", { readonly: true, label: "active mode" });
   met.addBinding(m, "fps", { readonly: true, format: (v: number) => v.toFixed(0) });
   met.addBinding(m, "fps", { readonly: true, view: "graph", min: 0, max: 165, label: " " });
   met.addBinding(m, "frameMs", { readonly: true, format: (v: number) => v.toFixed(1) + " ms", label: "frame ms (cpu)" });
@@ -129,6 +135,9 @@ async function boot() {
   fGrid.addBinding(m, "avgPerCell", { readonly: true, format: (v: number) => v.toFixed(2), label: "avg / occ cell" });
   fGrid.addBinding(m, "maxPerCell", { readonly: true, format: (v: number) => v.toFixed(0), label: "max / cell" });
   fGrid.addBinding(m, "overflow", { readonly: true, format: (v: number) => v.toFixed(0), label: "overflow (B drops)" });
+  const fView = met.addFolder({ title: "world / view" });
+  fView.addBinding(m, "worldSize", { readonly: true, format: (v: number) => v.toFixed(2), label: "world size" });
+  fView.addBinding(m, "inView", { readonly: true, format: (v: number) => v.toFixed(0), label: "particles in view" });
 
   const hint = document.getElementById("hint");
   let debug = true;
@@ -145,7 +154,8 @@ async function boot() {
       debug = !debug;
       applyDebug();
     } else if (e.key === "m" || e.key === "M") {
-      params.mode = params.mode === "A" ? "B" : "A";
+      const order = ["auto", "A", "B"] as const;
+      params.mode = order[(order.indexOf(params.mode as any) + 1) % order.length];
       modeBinding.refresh();
     }
   });
@@ -200,6 +210,7 @@ async function boot() {
     acc += dt; frames++;
     if (acc >= 0.25) {
       if (debug) {
+        m.active = params.mode === "auto" ? `${engine.activeMode} (auto)` : engine.activeMode;
         m.fps = frames / acc;
         m.frameMs = frameMsSmooth;
         m.computeMs = engine.gpuMs;
@@ -211,6 +222,10 @@ async function boot() {
         m.avgPerCell = engine.occupied ? params.numParticles / engine.occupied : 0;
         m.maxPerCell = engine.maxCell;
         m.overflow = engine.overflow;
+        m.worldSize = engine.worldSize;
+        // Fraction of the world the current view window covers, x particle count.
+        const frac = Math.min(engine.viewSize / engine.worldSize, 1);
+        m.inView = params.numParticles * frac * frac;
         met.refresh();
       }
       acc = 0; frames = 0;
