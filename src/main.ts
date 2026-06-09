@@ -82,7 +82,7 @@ async function boot() {
   let modeBinding: any;
   for (const c of CONTROLS) {
     const parent = c.folder
-      ? (folders[c.folder] ??= pane.addFolder({ title: c.folder, expanded: false }))
+      ? (folders[c.folder] ??= pane.addFolder({ title: c.folder, expanded: c.folder === "auto switch" }))
       : pane;
     // numParticles drives per-frame dispatch/draw counts and buffer sizes.
     // Bind to a holder and only commit (+rebuild) on slider release, so

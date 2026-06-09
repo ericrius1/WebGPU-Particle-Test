@@ -62,7 +62,7 @@ export class Engine {
   numCells = 1;
   cellSize = 0.02;
   worldSize = 1;
-  viewSize = 0.75;
+  viewSize = 1.25;
   viewCenterX = 0.5;
   viewCenterY = 0.5;
 
